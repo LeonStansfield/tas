@@ -1,0 +1,14 @@
+# =============================================================================
+# OpenBao KBM plugin configuration (plugins/tas_kbm_openbao.py)
+# =============================================================================
+
+# OpenBao server URL (e.g. http://127.0.0.1:8200 (local))
+url: "https://127.0.0.1:8200"
+token: "${BAO_TOKEN}"
+mount_point: "secret"
+kv_version: 2
+secret_field: "secret"
+
+verify_ssl: true
+
+ca_bundle: "/opt/openbao/certs/ca.crt"

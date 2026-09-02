@@ -1,0 +1,39 @@
+# =============================================================================
+# OpenBao KBM plugin configuration (plugins/tas_kbm_openbao.py)
+# =============================================================================
+
+# OpenBao server URL
+# Dev mode:  http://127.0.0.1:8200 (plain HTTP, no TLS)
+# Production: https://127.0.0.1:8200 or https://openbao.internal.company.com:8200 (with TLS)
+url: "https://127.0.0.1:8200"
+
+# Authentication Token (supports ${ENV_VAR} substitution)
+token: "${BAO_TOKEN}"
+
+# Secrets Engine Settings
+mount_point: "secret"  # KV mount path (default: "secret")
+kv_version: 2          # KV engine version: 1 or 2
+secret_field: "secret" # Field name within the secret JSON payload
+
+# TLS / Network Settings
+# =====================
+# For development (no TLS verification, HTTP only):
+#   url: "http://127.0.0.1:8200"
+#   verify_ssl: false
+#
+# For production (with custom CA certificate, HTTPS):
+#   url: "https://127.0.0.1:8200"  (or your actual hostname)
+#   verify_ssl: true
+#   ca_bundle: "/opt/openbao/certs/ca.crt"
+#
+# For production (with system default CAs, HTTPS):
+#   url: "https://openbao.internal.company.com:8200"
+#   verify_ssl: true
+#   ca_bundle: ""  (or omit entirely)
+
+# TEMPORARY: Disable SSL verification for testing
+# The CA cert lacks proper key usage extensions
+# For production, regenerate the CA with proper X.509 extensions
+verify_ssl: false
+ca_bundle: "/opt/openbao/certs/ca.crt"  # Path to your OpenBao CA certificate
+requests_timeout: 30   # HTTP request timeout in seconds
