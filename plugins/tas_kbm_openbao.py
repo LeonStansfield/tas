@@ -1,5 +1,3 @@
-
-
 #
 # TEE Attestation Service - OpenBao Plugin Integration
 #
@@ -22,6 +20,8 @@ from typing import Any, Dict, Optional
 from urllib.parse import urljoin
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 
 try:
     import yaml  # PyYAML (listed in requirements.txt)
@@ -148,6 +148,10 @@ class _OpenBaoClient:
         verify_ssl: bool = True,
         ca_bundle: Optional[str] = None,
         requests_timeout: int = 30,
+        retry_total: int = 3,
+        retry_backoff_factor: float = 0.05,
+        pool_connections: int = 10,
+        pool_maxsize: int = 20,
     ):
         self.url = url.rstrip("/")
         self.token = token
@@ -157,6 +161,10 @@ class _OpenBaoClient:
         self.verify_ssl = verify_ssl
         self.ca_bundle = ca_bundle
         self.requests_timeout = requests_timeout
+        self.retry_total = max(0, int(retry_total))
+        self.retry_backoff_factor = max(0.0, float(retry_backoff_factor))
+        self.pool_connections = max(1, int(pool_connections))
+        self.pool_maxsize = max(1, int(pool_maxsize))
 
         # Configure SSL verify parameter for requests library
         # verify can be: False (disable verification), True (use system CAs), or str (path to CA bundle)
@@ -179,6 +187,26 @@ class _OpenBaoClient:
         self.session = requests.Session()
         if self.token:
             self.session.headers.update({"X-Vault-Token": self.token})
+
+        # Retry strategy
+        retry_strategy = Retry(
+            total=self.retry_total,
+            connect=self.retry_total,
+            read=self.retry_total,
+            backoff_factor=self.retry_backoff_factor, # exponential backoff factor for retries
+            status_forcelist=[429, 500, 502, 503, 504], # HTTP status codes (429: Rate limits, 500: Internal Server Error, 502: Bad Gateway, 503: Service Unavailable, 504: Gateway Timeout)
+            allowed_methods=frozenset(["GET", "HEAD", "OPTIONS"]),
+            raise_on_status=False, # allows the application layer to parse non-transient HTTP errors cleanly
+        )
+
+        # Connection pool adapter
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=self.pool_connections, # number of distinct host connection pools cached
+            pool_maxsize=self.pool_maxsize, #maximum concurrent connections maintained in each pool
+        )
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
         logger.info(
             f"OpenBao KBM client initialized for {self.url} (mount: {self.mount_point}, KV v{self.kv_version})"
@@ -243,8 +271,7 @@ class _OpenBaoClient:
         return _secret_to_bytes(val)
 
 
-# Public KBM Plugin Interface
-
+# KBM Plugin Interface
 
 def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoClient:
     """
@@ -259,6 +286,21 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
     logger.info("Initializing OpenBao KBM client connection")
     cfg = _load_config_file(config_file)
 
+    def _get_conf(key: str, env_var: str, default: Any, caster: type = str) -> Any:
+        # Helps resolve configuration values with type casting.
+        val = cfg.get(key)
+        if val is None: # Then environment variable
+            val = os.getenv(env_var)
+        if val is None: # Fallback to default
+            return default
+        try:
+            return caster(val)
+        except (ValueError, TypeError):
+            logger.warning(
+                f"Invalid value for {key}/{env_var}: '{val}', using default {default}"
+            )
+            return default
+
     url = (
         cfg.get("url")
         or os.getenv("BAO_ADDR")
@@ -267,11 +309,17 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
     )
     token = cfg.get("token") or os.getenv("BAO_TOKEN") or os.getenv("VAULT_TOKEN")
     mount_point = cfg.get("mount_point", "secret")
-    kv_version = cfg.get("kv_version", 2)
+    kv_version = _get_conf("kv_version", "BAO_KV_VERSION", 2, int)
     secret_field = cfg.get("secret_field", "secret")
     verify_ssl = cfg.get("verify_ssl", True)
     ca_bundle = cfg.get("ca_bundle")
-    requests_timeout = cfg.get("requests_timeout", 30)
+    requests_timeout = _get_conf("requests_timeout", "BAO_REQUESTS_TIMEOUT", 30, int)
+
+    # Connection pooling and retry options (config file takes precedence)
+    retry_total = _get_conf("retry_total", "BAO_RETRY_TOTAL", 3, int)
+    retry_backoff_factor = _get_conf("retry_backoff_factor", "BAO_RETRY_BACKOFF_FACTOR", 0.05, float)
+    pool_connections = _get_conf("pool_connections", "BAO_POOL_CONNECTIONS", 10, int)
+    pool_maxsize = _get_conf("pool_maxsize", "BAO_POOL_MAXSIZE", 20, int)
 
     client = _OpenBaoClient(
         url=url,
@@ -282,6 +330,10 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
         verify_ssl=verify_ssl,
         ca_bundle=ca_bundle,
         requests_timeout=requests_timeout,
+        retry_total=retry_total,
+        retry_backoff_factor=retry_backoff_factor,
+        pool_connections=pool_connections,
+        pool_maxsize=pool_maxsize,
     )
     return client
 

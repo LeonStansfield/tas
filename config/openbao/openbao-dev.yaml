@@ -5,3 +5,8 @@ kv_version: 2
 secret_field: "secret"
 verify_ssl: false
 requests_timeout: 30
+
+retry_total: 3
+retry_backoff_factor: 0.05
+pool_connections: 10
+pool_maxsize: 20
