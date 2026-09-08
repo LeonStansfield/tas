@@ -208,12 +208,3 @@ appendonlydir/
 dump.rdb
 *.rdb
 *.aof
-
-# Key and environment files
-*.pem
-*.key
-.env
-
-# Config files
-config/*.yaml
-config/*.json

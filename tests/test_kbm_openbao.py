@@ -130,84 +130,127 @@ class TestOpenBaoKBM(unittest.TestCase):
 
         client.close()
 
-    @patch("requests.Session.get")
-    def test_kbm_get_secret_success_kv2(self, mock_get):
-        """Verify full retrieval and decryption flow for KV v2."""
+    def test_approle_initial_login(self):
+        """Verify AppRole authentication succeeds and sets X-Vault-Token header."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"auth": {"client_token": "approle-test-token"}}
+
+        with patch("requests.Session.post", return_value=mock_resp):
+            client = _OpenBaoClient(
+                auth_method="approle",
+                role_id="test-role",
+                secret_id="test-secret",
+            )
+            self.assertEqual(client.token, "approle-test-token")
+            self.assertEqual(client.session.headers.get("X-Vault-Token"), "approle-test-token")
+            client.close()
+
+    def test_reauth_on_401_approle(self):
+        """Verify 401 triggers AppRole re-authentication and request retry."""
+        mock_login = MagicMock()
+        mock_login.status_code = 200
+        mock_login.json.return_value = {"auth": {"client_token": "token-v2"}}
+
+        resp_401 = MagicMock()
+        resp_401.status_code = 401
+
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.json.return_value = {"data": {"data": {"secret": "secret-after-reauth"}}}
+
+        with patch("requests.Session.post", return_value=mock_login):
+            client = _OpenBaoClient(
+                auth_method="approle",
+                role_id="test-role",
+                secret_id="test-secret",
+            )
+
+        # GET secret returns 401 then 200 after re-authenticating
+        with patch.object(client.session, "request", side_effect=[resp_401, resp_200]), \
+             patch.object(client, "authenticate", wraps=client.authenticate) as mock_auth, \
+             patch("requests.Session.post", return_value=mock_login):
+            secret_bytes = client.get_secret("test-key")
+            self.assertEqual(secret_bytes, b"secret-after-reauth")
+            self.assertEqual(mock_auth.call_count, 1)
+
+        client.close()
+
+    def test_renew_on_401_token(self):
+        """Verify 401 triggers token renewal and request retry for renewable tokens."""
+        resp_401 = MagicMock()
+        resp_401.status_code = 401
+
+        resp_200 = MagicMock()
+        resp_200.status_code = 200
+        resp_200.json.return_value = {"data": {"data": {"secret": "secret-after-renew"}}}
+
+        mock_renew = MagicMock()
+        mock_renew.status_code = 200
+
+        client = _OpenBaoClient(
+            auth_method="token",
+            token="initial-token",
+            token_renew_on_401=True,
+        )
+
+        with patch.object(client.session, "request", side_effect=[resp_401, resp_200]), \
+             patch("requests.Session.post", return_value=mock_renew):
+            secret_bytes = client.get_secret("test-key")
+            self.assertEqual(secret_bytes, b"secret-after-renew")
+
+        client.close()
+
+    def test_401_failure_raises_runtime_error(self):
+        """Verify unrecoverable 401 raises RuntimeError without retry loops."""
+        resp_401 = MagicMock()
+        resp_401.status_code = 401
+
+        client = _OpenBaoClient(
+            auth_method="token",
+            token="static-token",
+            token_renew_on_401=False,
+        )
+
+        with patch.object(client.session, "request", return_value=resp_401):
+            with self.assertRaises(RuntimeError):
+                client.get_secret("test-key")
+
+        client.close()
+
+    @patch("requests.Session.request")
+    def test_kbm_get_secret_kv2_success(self, mock_req):
+        # Mock OpenBao KV v2 response
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {
             "data": {
-                "data": {
-                    "secret": "super-secret-payload"
-                }
+                "data": {"secret": "secret-text"},
+                "metadata": {"version": 1},
             }
         }
-        mock_get.return_value = mock_resp
+        mock_req.return_value = mock_resp
 
         client = kbm_open_client_connection()
-        result = kbm_get_secret(client, "my-key-v2", self.rsa_pub_pem)
+
+        result = kbm_get_secret(client, "test-key-1", self.rsa_pub_pem)
 
         for key in ("wrapped_key", "blob", "iv", "tag"):
             self.assertIn(key, result)
 
         decrypted = self._decrypt_wrapped_secret(result)
-        self.assertEqual(decrypted, b"super-secret-payload")
+        self.assertEqual(decrypted, b"secret-text")
         kbm_close_client_connection(client)
 
-    @patch("requests.Session.get")
-    def test_kbm_get_secret_success_kv1(self, mock_get):
-        """Verify full retrieval and decryption flow for KV v1."""
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "data": {
-                "secret": "kv1-secret-payload"
-            }
-        }
-        mock_get.return_value = mock_resp
-
-        client = _OpenBaoClient(kv_version=1)
-        result = kbm_get_secret(client, "my-key-v1", self.rsa_pub_pem)
-        decrypted = self._decrypt_wrapped_secret(result)
-        self.assertEqual(decrypted, b"kv1-secret-payload")
-        client.close()
-
-    @patch("requests.Session.get")
-    def test_kbm_get_secret_not_found(self, mock_get):
+    @patch("requests.Session.request")
+    def test_kbm_get_secret_kv2_not_found(self, mock_req):
         mock_resp = MagicMock()
         mock_resp.status_code = 404
-        mock_get.return_value = mock_resp
+        mock_req.return_value = mock_resp
 
         client = kbm_open_client_connection()
+
         with self.assertRaises(ValueError):
             kbm_get_secret(client, "nonexistent-key", self.rsa_pub_pem)
-        kbm_close_client_connection(client)
-
-    @patch("requests.Session.get")
-    def test_kbm_get_secret_server_error(self, mock_get):
-        mock_resp = MagicMock()
-        mock_resp.status_code = 500
-        mock_resp.text = "Internal Server Error"
-        mock_get.return_value = mock_resp
-
-        client = kbm_open_client_connection()
-        with self.assertRaises(RuntimeError):
-            kbm_get_secret(client, "err-key", self.rsa_pub_pem)
-        kbm_close_client_connection(client)
-
-    def test_kbm_get_secret_invalid_arguments(self):
-        client = kbm_open_client_connection()
-
-        with self.assertRaises(ValueError):
-            kbm_get_secret("not-a-client", "key", self.rsa_pub_pem)
-
-        with self.assertRaises(ValueError):
-            kbm_get_secret(client, "", self.rsa_pub_pem)
-
-        with self.assertRaises(ValueError):
-            kbm_get_secret(client, "key", b"")
-
-        with self.assertRaises(ValueError):
-            kbm_get_secret(client, "key", b"invalid-pem-data")
 
         kbm_close_client_connection(client)

@@ -1,7 +1,6 @@
 # OpenBao KBM plugin configuration (plugins/tas_kbm_openbao.py)
 # OpenBao server URL (e.g. http://127.0.0.1:8200 (local))
 url: "https://127.0.0.1:8200"
-token: "${BAO_TOKEN}"
 mount_point: "secret"
 kv_version: 2
 secret_field: "secret"
@@ -9,7 +8,13 @@ secret_field: "secret"
 verify_ssl: true
 
 ca_bundle: "/opt/openbao/certs/ca.crt"
-request_timeout: 30
+requests_timeout: 30
+
+auth_method: "approle"
+role_id: "${BAO_ROLE_ID}"
+secret_id: "${BAO_SECRET_ID}"
+# secret_id_file: "/var/run/secrets/openbao/secret-id" # Alternative to secret_id
+approle_mount: "approle"
 
 retry_total: 3
 retry_backoff_factor: 0.05

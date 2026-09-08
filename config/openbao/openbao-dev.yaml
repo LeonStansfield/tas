@@ -1,10 +1,13 @@
 url: "http://127.0.0.1:8200"
-token: "${BAO_TOKEN}"
 mount_point: "secret"
 kv_version: 2
 secret_field: "secret"
 verify_ssl: false
 requests_timeout: 30
+
+auth_method: "token"
+token: "${BAO_TOKEN}"
+token_renew_on_401: true
 
 retry_total: 3
 retry_backoff_factor: 0.05
