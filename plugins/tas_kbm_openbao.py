@@ -319,6 +319,9 @@ class _OpenBaoClient:
                 if self.token == current_token:
                     self.authenticate()
 
+            if "headers" in kwargs and isinstance(kwargs["headers"], dict) and "X-Vault-Token" in kwargs["headers"]:
+                kwargs["headers"]["X-Vault-Token"] = self.token
+
             try:
                 resp = self.session.request(method, url, **kwargs)
             except requests.RequestException as e:
@@ -429,11 +432,11 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
     approle_mount = _get_conf("approle_mount", "BAO_APPROLE_MOUNT", "approle")
     token_renew_on_401 = _get_conf("token_renew_on_401", "BAO_TOKEN_RENEW_ON_401", True, bool)
 
-    mount_point = cfg.get("mount_point", "secret")
+    mount_point = _get_conf("mount_point", "BAO_MOUNT_POINT", "secret")
     kv_version = _get_conf("kv_version", "BAO_KV_VERSION", 2, int)
-    secret_field = cfg.get("secret_field", "secret")
-    verify_ssl = cfg.get("verify_ssl", True)
-    ca_bundle = cfg.get("ca_bundle")
+    secret_field = _get_conf("secret_field", "BAO_SECRET_FIELD", "secret")
+    verify_ssl = _get_conf("verify_ssl", "BAO_VERIFY_SSL", True, bool)
+    ca_bundle = _get_conf("ca_bundle", "BAO_CACERT", os.getenv("VAULT_CACERT"))
     requests_timeout = _get_conf("requests_timeout", "BAO_REQUESTS_TIMEOUT", 30, int)
 
     # Connection pooling and retry options (config file takes precedence)
