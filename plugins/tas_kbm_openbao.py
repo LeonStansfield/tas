@@ -392,22 +392,21 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
     logger.info("Initializing OpenBao KBM client connection")
     cfg = _load_config_file(config_file)
 
-    def _to_bool(val: Any) -> bool:
-        if isinstance(val, bool):
-            return val
-        return str(val).strip().lower() in ("true", "1", "yes")
-
-    def _get_conf(key: str, env_var: str, default: Any, caster: type = str) -> Any:
-        # Helps resolve configuration values with type casting.
+    def _get_conf(key, env_var, default, caster=str):
         val = cfg.get(key)
-        if val is None: # Then environment variable
+
+        if val is None:
             val = os.getenv(env_var)
-        if val is None: # Fallback to default
+
+        if val is None:
             return default
+
         try:
             if caster is bool:
-                return _to_bool(val)
+                return str(val).strip().lower() in ("true", "1", "yes")
+
             return caster(val)
+
         except (ValueError, TypeError):
             logger.warning(
                 f"Invalid value for {key}/{env_var}: '{val}', using default {default}"
