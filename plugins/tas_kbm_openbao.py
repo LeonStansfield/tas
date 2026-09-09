@@ -87,7 +87,9 @@ def _secret_to_bytes(v: Any) -> bytes:
         return v.encode("utf-8")
     return json.dumps(v, separators=(",", ":")).encode("utf-8")
 
+
 # Configuration File Handling
+
 
 def _load_config_file(config_file: Optional[str]) -> Dict[str, Any]:
     """Load configuration from YAML or JSON file with environment variable substitution."""
@@ -209,10 +211,16 @@ class _OpenBaoClient:
             total=self.retry_total,
             connect=self.retry_total,
             read=self.retry_total,
-            backoff_factor=self.retry_backoff_factor, # exponential backoff factor for retries
-            status_forcelist=[429, 500, 502, 503, 504], # HTTP status codes (429: Rate limits, 500: Internal Server Error, 502: Bad Gateway, 503: Service Unavailable, 504: Gateway Timeout)
+            backoff_factor=self.retry_backoff_factor,  # exponential backoff factor for retries
+            status_forcelist=[
+                429,
+                500,
+                502,
+                503,
+                504,
+            ],  # HTTP status codes (429: Rate limits, 500: Internal Server Error, 502: Bad Gateway, 503: Service Unavailable, 504: Gateway Timeout)
             allowed_methods=frozenset(["GET", "HEAD", "OPTIONS"]),
-            raise_on_status=False, # allows the application layer to parse non-transient HTTP errors cleanly
+            raise_on_status=False,  # allows the application layer to parse non-transient HTTP errors cleanly
         )
 
         # Connection pool adapter
@@ -256,7 +264,9 @@ class _OpenBaoClient:
                     timeout=self.requests_timeout,
                 )
             except requests.RequestException as e:
-                raise RuntimeError(f"OpenBao AppRole login connection error: {e}") from e
+                raise RuntimeError(
+                    f"OpenBao AppRole login connection error: {e}"
+                ) from e
 
             if resp.status_code != 200:
                 raise RuntimeError(
@@ -265,7 +275,9 @@ class _OpenBaoClient:
 
             token = resp.json().get("auth", {}).get("client_token")
             if not token:
-                raise RuntimeError("OpenBao AppRole login response missing client_token")
+                raise RuntimeError(
+                    "OpenBao AppRole login response missing client_token"
+                )
 
             self.token = token
             self.session.headers["X-Vault-Token"] = token
@@ -285,7 +297,9 @@ class _OpenBaoClient:
                     timeout=self.requests_timeout,
                 )
             except requests.RequestException as e:
-                raise RuntimeError(f"OpenBao token renewal connection error: {e}") from e
+                raise RuntimeError(
+                    f"OpenBao token renewal connection error: {e}"
+                ) from e
 
             if resp.status_code != 200:
                 raise RuntimeError(
@@ -313,13 +327,19 @@ class _OpenBaoClient:
 
         # Token was rejected (expired or revoked); re-authenticate once under lock and retry
         if resp.status_code == 401:
-            logger.info("Received 401 from OpenBao; attempting re-authentication and retry")
+            logger.info(
+                "Received 401 from OpenBao; attempting re-authentication and retry"
+            )
             with self._auth_lock:
                 # Re-authenticate only if another concurrent thread has not already refreshed the token
                 if self.token == current_token:
                     self.authenticate()
 
-            if "headers" in kwargs and isinstance(kwargs["headers"], dict) and "X-Vault-Token" in kwargs["headers"]:
+            if (
+                "headers" in kwargs
+                and isinstance(kwargs["headers"], dict)
+                and "X-Vault-Token" in kwargs["headers"]
+            ):
                 kwargs["headers"]["X-Vault-Token"] = self.token
 
             try:
@@ -357,9 +377,7 @@ class _OpenBaoClient:
             logger.error(
                 f"OpenBao secret retrieval failed ({resp.status_code}): {resp.text}"
             )
-            raise RuntimeError(
-                f"OpenBao API error ({resp.status_code}): {resp.text}"
-            )
+            raise RuntimeError(f"OpenBao API error ({resp.status_code}): {resp.text}")
 
         payload = resp.json()
         if self.kv_version == 2:
@@ -381,6 +399,7 @@ class _OpenBaoClient:
 
 
 # KBM Plugin Interface
+
 
 def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoClient:
     """
@@ -430,7 +449,9 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
     secret_id = _get_conf("secret_id", "BAO_SECRET_ID", None)
     secret_id_file = _get_conf("secret_id_file", "BAO_SECRET_ID_FILE", None)
     approle_mount = _get_conf("approle_mount", "BAO_APPROLE_MOUNT", "approle")
-    token_renew_on_401 = _get_conf("token_renew_on_401", "BAO_TOKEN_RENEW_ON_401", True, bool)
+    token_renew_on_401 = _get_conf(
+        "token_renew_on_401", "BAO_TOKEN_RENEW_ON_401", True, bool
+    )
 
     mount_point = _get_conf("mount_point", "BAO_MOUNT_POINT", "secret")
     kv_version = _get_conf("kv_version", "BAO_KV_VERSION", 2, int)
@@ -441,7 +462,9 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
 
     # Connection pooling and retry options (config file takes precedence)
     retry_total = _get_conf("retry_total", "BAO_RETRY_TOTAL", 3, int)
-    retry_backoff_factor = _get_conf("retry_backoff_factor", "BAO_RETRY_BACKOFF_FACTOR", 0.05, float)
+    retry_backoff_factor = _get_conf(
+        "retry_backoff_factor", "BAO_RETRY_BACKOFF_FACTOR", 0.05, float
+    )
     pool_connections = _get_conf("pool_connections", "BAO_POOL_CONNECTIONS", 10, int)
     pool_maxsize = _get_conf("pool_maxsize", "BAO_POOL_MAXSIZE", 20, int)
 

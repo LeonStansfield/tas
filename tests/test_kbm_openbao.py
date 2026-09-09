@@ -13,15 +13,16 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 import requests
-from urllib3.response import HTTPResponse
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import padding as asympadding, rsa
+from cryptography.hazmat.primitives.asymmetric import padding as asympadding
+from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+from urllib3.response import HTTPResponse
 
 from plugins.tas_kbm_openbao import (
-    _OpenBaoClient,
     _load_config_file,
+    _OpenBaoClient,
     kbm_close_client_connection,
     kbm_get_secret,
     kbm_open_client_connection,
@@ -108,7 +109,9 @@ class TestOpenBaoKBM(unittest.TestCase):
             preload_content=False,
             request_method="GET",
         )
-        body_200 = json.dumps({"data": {"data": {"secret": "retry-success"}}}).encode("utf-8")
+        body_200 = json.dumps({"data": {"data": {"secret": "retry-success"}}}).encode(
+            "utf-8"
+        )
         raw_200 = HTTPResponse(
             body=io.BytesIO(body_200),
             headers={"Content-Type": "application/json"},
@@ -118,12 +121,13 @@ class TestOpenBaoKBM(unittest.TestCase):
             request_method="GET",
         )
 
-        with patch(
-            "urllib3.connectionpool.HTTPConnectionPool._get_conn"
-        ), patch(
-            "urllib3.connectionpool.HTTPConnectionPool._make_request",
-            side_effect=[raw_503, raw_200],
-        ) as mock_make_request:
+        with (
+            patch("urllib3.connectionpool.HTTPConnectionPool._get_conn"),
+            patch(
+                "urllib3.connectionpool.HTTPConnectionPool._make_request",
+                side_effect=[raw_503, raw_200],
+            ) as mock_make_request,
+        ):
             secret_bytes = client.get_secret("test-retry")
             self.assertEqual(secret_bytes, b"retry-success")
             self.assertEqual(mock_make_request.call_count, 2)
@@ -143,7 +147,9 @@ class TestOpenBaoKBM(unittest.TestCase):
                 secret_id="test-secret",
             )
             self.assertEqual(client.token, "approle-test-token")
-            self.assertEqual(client.session.headers.get("X-Vault-Token"), "approle-test-token")
+            self.assertEqual(
+                client.session.headers.get("X-Vault-Token"), "approle-test-token"
+            )
             client.close()
 
     def test_reauth_on_401_approle(self):
@@ -157,7 +163,9 @@ class TestOpenBaoKBM(unittest.TestCase):
 
         resp_200 = MagicMock()
         resp_200.status_code = 200
-        resp_200.json.return_value = {"data": {"data": {"secret": "secret-after-reauth"}}}
+        resp_200.json.return_value = {
+            "data": {"data": {"secret": "secret-after-reauth"}}
+        }
 
         with patch("requests.Session.post", return_value=mock_login):
             client = _OpenBaoClient(
@@ -167,9 +175,13 @@ class TestOpenBaoKBM(unittest.TestCase):
             )
 
         # GET secret returns 401 then 200 after re-authenticating
-        with patch.object(client.session, "request", side_effect=[resp_401, resp_200]), \
-             patch.object(client, "authenticate", wraps=client.authenticate) as mock_auth, \
-             patch("requests.Session.post", return_value=mock_login):
+        with (
+            patch.object(client.session, "request", side_effect=[resp_401, resp_200]),
+            patch.object(
+                client, "authenticate", wraps=client.authenticate
+            ) as mock_auth,
+            patch("requests.Session.post", return_value=mock_login),
+        ):
             secret_bytes = client.get_secret("test-key")
             self.assertEqual(secret_bytes, b"secret-after-reauth")
             self.assertEqual(mock_auth.call_count, 1)
@@ -183,7 +195,9 @@ class TestOpenBaoKBM(unittest.TestCase):
 
         resp_200 = MagicMock()
         resp_200.status_code = 200
-        resp_200.json.return_value = {"data": {"data": {"secret": "secret-after-renew"}}}
+        resp_200.json.return_value = {
+            "data": {"data": {"secret": "secret-after-renew"}}
+        }
 
         mock_renew = MagicMock()
         mock_renew.status_code = 200
@@ -194,8 +208,10 @@ class TestOpenBaoKBM(unittest.TestCase):
             token_renew_on_401=True,
         )
 
-        with patch.object(client.session, "request", side_effect=[resp_401, resp_200]), \
-             patch("requests.Session.post", return_value=mock_renew):
+        with (
+            patch.object(client.session, "request", side_effect=[resp_401, resp_200]),
+            patch("requests.Session.post", return_value=mock_renew),
+        ):
             secret_bytes = client.get_secret("test-key")
             self.assertEqual(secret_bytes, b"secret-after-renew")
 
