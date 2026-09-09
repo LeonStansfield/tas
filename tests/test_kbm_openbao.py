@@ -270,3 +270,149 @@ class TestOpenBaoKBM(unittest.TestCase):
             kbm_get_secret(client, "nonexistent-key", self.rsa_pub_pem)
 
         kbm_close_client_connection(client)
+
+    def test_init_create_key_if_absent_requires_redis(self):
+        """create_key_if_absent=True without redis_client must raise ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            _OpenBaoClient(create_key_if_absent=True, redis_client=None)
+        self.assertIn("Redis client is required", str(ctx.exception))
+
+    def test_init_create_key_if_absent_checks_redis_ping(self):
+        """create_key_if_absent=True pings Redis and raises RuntimeError if unhealthy."""
+        mock_redis = MagicMock()
+        mock_redis.ping.side_effect = Exception("Redis unreachable")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _OpenBaoClient(create_key_if_absent=True, redis_client=mock_redis)
+        self.assertIn("Redis client connection failed", str(ctx.exception))
+
+    @patch("plugins.tas_kbm_openbao.redis_lock.Lock")
+    def test_get_secret_create_if_absent_kv2_success(self, mock_lock_cls):
+        """Verify key creation under lock for KV v2 when key does not exist initially."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+
+        mock_lock = MagicMock()
+        mock_lock.__enter__.return_value = mock_lock
+        mock_lock.__exit__.return_value = False
+        mock_lock_cls.return_value = mock_lock
+
+        client = _OpenBaoClient(
+            create_key_if_absent=True,
+            redis_client=mock_redis,
+            kv_version=2,
+            mount_point="secret",
+            secret_field="secret",
+            requests_timeout=10,
+        )
+
+        resp_404 = MagicMock(status_code=404)
+        resp_200_create = MagicMock(status_code=200, text="ok")
+
+        # Calls: 1) Initial check -> 404, 2) In-lock double-check -> 404, 3) Write secret -> 200
+        with patch.object(
+            client, "_make_request", side_effect=[resp_404, resp_404, resp_200_create]
+        ) as mock_req:
+            secret = client.get_secret("new-key")
+            self.assertEqual(len(secret), 32)
+            mock_lock_cls.assert_called_once_with(
+                mock_redis,
+                "tas:openbao:create_key:new-key",
+                timeout=70,
+                blocking=True,
+                blocking_timeout=60,
+            )
+            self.assertEqual(mock_req.call_count, 3)
+            # Verify the write call payload has cas: 0
+            create_call_args = mock_req.call_args_list[2]
+            self.assertEqual(create_call_args[0], ("POST", "/v1/secret/data/new-key"))
+            payload = create_call_args[1]["json"]
+            self.assertIn("data", payload)
+            self.assertEqual(payload.get("options"), {"cas": 0})
+
+        client.close()
+
+    @patch("plugins.tas_kbm_openbao.redis_lock.Lock")
+    def test_get_secret_create_if_absent_double_check_race(self, mock_lock_cls):
+        """Verify that if another process created the key during lock wait, stored value is returned."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+
+        mock_lock = MagicMock()
+        mock_lock.__enter__.return_value = mock_lock
+        mock_lock.__exit__.return_value = False
+        mock_lock_cls.return_value = mock_lock
+
+        client = _OpenBaoClient(
+            create_key_if_absent=True,
+            redis_client=mock_redis,
+            kv_version=2,
+        )
+
+        resp_404 = MagicMock(status_code=404)
+        resp_200_existing = MagicMock(
+            status_code=200,
+            json=lambda: {"data": {"data": {"secret": "created-by-competitor"}}},
+        )
+
+        # Calls: 1) Initial check -> 404, 2) In-lock double-check -> 200 (created by competitor)
+        with patch.object(
+            client, "_make_request", side_effect=[resp_404, resp_200_existing]
+        ) as mock_req:
+            secret = client.get_secret("race-key")
+            self.assertEqual(secret, b"created-by-competitor")
+            self.assertEqual(mock_req.call_count, 2)
+
+        client.close()
+
+    @patch("plugins.tas_kbm_openbao.redis_lock.Lock")
+    def test_get_secret_create_cas_conflict_fallback(self, mock_lock_cls):
+        """Verify fallback when write fails with CAS conflict (400 check-and-set)."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+
+        mock_lock = MagicMock()
+        mock_lock.__enter__.return_value = mock_lock
+        mock_lock.__exit__.return_value = False
+        mock_lock_cls.return_value = mock_lock
+
+        client = _OpenBaoClient(
+            create_key_if_absent=True,
+            redis_client=mock_redis,
+            kv_version=2,
+        )
+
+        resp_404 = MagicMock(status_code=404)
+        resp_400_cas = MagicMock(
+            status_code=400, text="check-and-set parameter did not match"
+        )
+        resp_200_existing = MagicMock(
+            status_code=200,
+            json=lambda: {"data": {"data": {"secret": "winner-secret"}}},
+        )
+
+        # Calls: 1) Initial check -> 404, 2) In-lock double-check -> 404, 3) Write -> 400 CAS, 4) Re-fetch -> 200
+        with patch.object(
+            client,
+            "_make_request",
+            side_effect=[resp_404, resp_404, resp_400_cas, resp_200_existing],
+        ) as mock_req:
+            secret = client.get_secret("cas-key")
+            self.assertEqual(secret, b"winner-secret")
+            self.assertEqual(mock_req.call_count, 4)
+
+        client.close()
+
+    def test_kbm_open_client_connection_with_redis(self):
+        """Test kbm_open_client_connection passes redis_client and parses create_key_if_absent."""
+        mock_redis = MagicMock()
+        mock_redis.ping.return_value = True
+
+        with patch(
+            "plugins.tas_kbm_openbao._load_config_file",
+            return_value={"create_key_if_absent": True},
+        ):
+            client = kbm_open_client_connection(redis_client=mock_redis)
+            self.assertTrue(client.create_key_if_absent)
+            self.assertIs(client.redis_client, mock_redis)
+            client.close()

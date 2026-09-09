@@ -9,6 +9,10 @@ auth_method: "token"
 token: "${BAO_TOKEN}"
 token_renew_on_401: true
 
+# Auto-create key options
+create_key_if_absent: false
+generated_secret_bytes: 32
+
 retry_total: 3
 retry_backoff_factor: 0.05
 pool_connections: 10

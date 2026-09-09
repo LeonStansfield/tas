@@ -16,6 +16,10 @@ secret_id: "${BAO_SECRET_ID}"
 # secret_id_file: "/var/run/secrets/openbao/secret-id" # Alternative to secret_id
 approle_mount: "approle"
 
+# Auto-create key options
+create_key_if_absent: false
+generated_secret_bytes: 32
+
 retry_total: 3
 retry_backoff_factor: 0.05
 pool_connections: 10

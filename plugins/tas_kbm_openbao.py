@@ -29,6 +29,11 @@ try:
 except Exception:
     yaml = None
 
+try:
+    from redis import lock as redis_lock  # Redis locking for distributed sync
+except ImportError:
+    redis_lock = None
+
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding as asympadding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -42,11 +47,12 @@ from tas.tas_logging import get_logger
 # Setup logging for the OpenBao KBM plugin
 logger = get_logger("tas.plugins.tas_kbm_openbao")
 
-# Declare host dependencies (opt-in): currently no extra host kwargs required
-KBM_HOST_KWARGS = set()
+# Declare host dependencies (opt-in): requires redis_client for distributed locking
+KBM_HOST_KWARGS = {"redis_client"}
 
 AES_KEY_LEN = 32  # AES-256
 IV_LEN = 12  # AES-GCM IV size
+DEFAULT_SECRET_BYTES = 32  # Default length for auto-generated secrets
 
 
 # Crypto Helpers
@@ -161,6 +167,9 @@ class _OpenBaoClient:
         retry_backoff_factor: float = 0.05,
         pool_connections: int = 10,
         pool_maxsize: int = 20,
+        create_key_if_absent: bool = False,
+        redis_client: Optional[Any] = None,
+        generated_secret_bytes: int = DEFAULT_SECRET_BYTES,
     ):
         self.url = url.rstrip("/")
         self.token = token
@@ -180,6 +189,34 @@ class _OpenBaoClient:
         self.retry_backoff_factor = max(0.0, float(retry_backoff_factor))
         self.pool_connections = max(1, int(pool_connections))
         self.pool_maxsize = max(1, int(pool_maxsize))
+        self.create_key_if_absent = create_key_if_absent
+        self.redis_client = redis_client
+        self.generated_secret_bytes = max(16, int(generated_secret_bytes))
+
+        # Validate Redis client connectivity if create_key_if_absent is enabled
+        if self.create_key_if_absent:
+            if not self.redis_client:
+                raise ValueError(
+                    "Redis client is required when create_key_if_absent=true. "
+                    "Pass a Redis client via the redis_client parameter."
+                )
+            elif redis_lock is None:
+                raise ImportError(
+                    "redis-py library with lock support is required when create_key_if_absent=true. "
+                    "The redis lock module failed to import. "
+                    "Install or reinstall redis-py: pip install 'redis>=4.0'"
+                )
+            else:
+                try:
+                    self.redis_client.ping()
+                    logger.info(
+                        "Redis client is available and healthy for OpenBao distributed locking"
+                    )
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Redis client connection failed: {e}. "
+                        "Redis is required for safe key auto-creation in multi-process deployments."
+                    ) from e
 
         # Guards token updates across threads
         self._auth_lock = threading.Lock()
@@ -355,14 +392,13 @@ class _OpenBaoClient:
         if self.session:
             self.session.close()
 
-    def get_secret(self, key_id: str) -> bytes:
+    def _lookup_secret(self, key_id: str) -> Optional[bytes]:
         """
-        Retrieve secret bytes for the given key_id from OpenBao via REST API.
+        get secret bytes for key_id from OpenBao.
 
-        Supports both KV version 1 and KV version 2 engines.
+        Returns None if the key does not exist (HTTP 404).
+        Raises RuntimeError on API/network errors.
         """
-        logger.debug(f"Fetching secret from OpenBao for key_id: {key_id}")
-
         if self.kv_version == 2:
             endpoint = f"/v1/{self.mount_point}/data/{key_id}"
         else:
@@ -371,8 +407,7 @@ class _OpenBaoClient:
         resp = self._make_request("GET", endpoint)
 
         if resp.status_code == 404:
-            logger.error(f"Secret not found in OpenBao: {key_id}")
-            raise ValueError(f"Secret not found: {key_id}")
+            return None
         elif resp.status_code != 200:
             logger.error(
                 f"OpenBao secret retrieval failed ({resp.status_code}): {resp.text}"
@@ -397,16 +432,139 @@ class _OpenBaoClient:
 
         return _secret_to_bytes(val)
 
+    def _create_secret(self, key_id: str, secret_bytes: bytes) -> bytes:
+        """
+        Write a secret to OpenBao.
+
+        For KV v2, uses Check-And-Set (cas: 0) to ensure atomic creation without overwriting.
+        Returns the stored secret bytes (or existing bytes if lost CAS race).
+        """
+        logger.info(f"Writing auto-generated secret to OpenBao for key_id: {key_id}")
+        secret_str = _b64(secret_bytes)
+
+        if self.kv_version == 2:
+            endpoint = f"/v1/{self.mount_point}/data/{key_id}"
+            payload = {
+                "data": {self.secret_field: secret_str},
+                "options": {"cas": 0},
+            }
+        else:
+            endpoint = f"/v1/{self.mount_point}/{key_id}"
+            payload = {self.secret_field: secret_str}
+
+        resp = self._make_request("POST", endpoint, json=payload)
+
+        # Check for CAS conflict in KV v2 (HTTP 400 with cas error message)
+        if (
+            resp.status_code == 400
+            and self.kv_version == 2
+            and "check-and-set" in resp.text.lower()
+        ):
+            logger.warning(
+                f"CAS race conflict detected when creating key_id {key_id}; reading existing secret"
+            )
+            existing = self._lookup_secret(key_id)
+            if existing is not None:
+                return existing
+            logger.error(f"Secret {key_id} disappeared after CAS conflict")
+            raise ValueError(f"Secret not found after conflict: {key_id}")
+
+        if resp.status_code not in (200, 204):
+            logger.error(
+                f"OpenBao secret creation failed ({resp.status_code}): {resp.text}"
+            )
+            raise RuntimeError(
+                f"OpenBao secret creation failed ({resp.status_code}): {resp.text}"
+            )
+
+        return secret_bytes
+
+    def get_secret(self, key_id: str) -> bytes:
+        """
+        Retrieve secret bytes for the given key_id from OpenBao via REST API.
+
+        If the key does not exist and create_key_if_absent is enabled, auto-generates
+        and writes a new secret using distributed Redis locking and double-checked retrieval.
+        Supports both KV version 1 and KV version 2 engines.
+        """
+        logger.debug(f"Retrieving secret from OpenBao for key_id: {key_id}")
+
+        # Step 1: Fast-path lookup
+        secret_bytes = self._lookup_secret(key_id)
+        if secret_bytes is not None:
+            return secret_bytes
+
+        # Step 2: Handle key absent
+        if not self.create_key_if_absent:
+            logger.error(f"Secret not found in OpenBao: {key_id}")
+            raise ValueError(f"Secret not found: {key_id}")
+
+        logger.debug(
+            f"Key not found and create_key_if_absent=true, acquiring lock to create key: {key_id}"
+        )
+
+        try:
+            lock_key = f"tas:openbao:create_key:{key_id}"
+            req_timeout = self.requests_timeout
+            # Worst case inside the lock: lookup + create (each with potential reauth & retry)
+            operation_timeout = 6 * req_timeout
+            lock_timeout = operation_timeout + req_timeout
+            blocking_timeout = operation_timeout
+
+            logger.debug(
+                f"Lock timeout calculation: requests_timeout={req_timeout}s, "
+                f"operation_timeout={operation_timeout}s, "
+                f"lock_timeout={lock_timeout}s, "
+                f"blocking_timeout={blocking_timeout}s"
+            )
+
+            lock = redis_lock.Lock(
+                self.redis_client,
+                lock_key,
+                timeout=lock_timeout,
+                blocking=True,
+                blocking_timeout=blocking_timeout,
+            )
+
+            with lock:
+                logger.debug(f"Lock acquired for key: {key_id}")
+
+                # Double-check: was it created by another process while waiting for the lock?
+                secret_bytes = self._lookup_secret(key_id)
+                if secret_bytes is not None:
+                    logger.info(
+                        f"Key was created by another process during lock wait: {key_id}"
+                    )
+                    return secret_bytes
+
+                logger.debug(
+                    f"Creating key while holding lock (other clients are blocked): {key_id}"
+                )
+                generated_secret = _secrets.token_bytes(self.generated_secret_bytes)
+                created_secret = self._create_secret(key_id, generated_secret)
+                logger.info(
+                    f"Successfully auto-created secret in OpenBao for key_id: {key_id}"
+                )
+                return created_secret
+
+        except Exception as e:
+            logger.error(f"Key creation with lock failed for {key_id}: {e}")
+            raise
+
 
 # KBM Plugin Interface
 
 
-def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoClient:
+def kbm_open_client_connection(
+    config_file: Optional[str] = None,
+    redis_client: Optional[Any] = None,
+) -> _OpenBaoClient:
     """
     Initialize and return the OpenBao KBM client handle.
 
     Args:
         config_file: Path to plugin configuration file (YAML or JSON)
+        redis_client: Optional Redis client for distributed locking (provided by TAS host)
 
     Returns:
         _OpenBaoClient handle for use with kbm_get_secret
@@ -468,6 +626,26 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
     pool_connections = _get_conf("pool_connections", "BAO_POOL_CONNECTIONS", 10, int)
     pool_maxsize = _get_conf("pool_maxsize", "BAO_POOL_MAXSIZE", 20, int)
 
+    # Auto-create key options
+    create_key_if_absent = _get_conf(
+        "create_key_if_absent", "BAO_CREATE_KEY_IF_ABSENT", False, bool
+    )
+    generated_secret_bytes = _get_conf(
+        "generated_secret_bytes",
+        "BAO_GENERATED_SECRET_BYTES",
+        DEFAULT_SECRET_BYTES,
+        int,
+    )
+
+    if create_key_if_absent:
+        if redis_client is None:
+            raise ValueError(
+                "create_key_if_absent=true but no Redis client provided to kbm_open_client_connection(). "
+                "Pass a Redis client via the redis_client parameter."
+            )
+        logger.info("Auto-create secret keys is ENABLED (create_key_if_absent=true)")
+        logger.debug("Redis client provided for distributed key creation locking")
+
     client = _OpenBaoClient(
         url=url,
         token=token,
@@ -487,6 +665,9 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
         retry_backoff_factor=retry_backoff_factor,
         pool_connections=pool_connections,
         pool_maxsize=pool_maxsize,
+        create_key_if_absent=create_key_if_absent,
+        redis_client=redis_client,
+        generated_secret_bytes=generated_secret_bytes,
     )
     return client
 
