@@ -29,7 +29,7 @@ auth_method: "approle"
 # approle_mount: "approle"
 # token_renew_on_401: true
 role_id: "${BAO_ROLE_ID}"
-secret_id_file: "/home/stansfie/openbao/approle/secret_id"
+secret_id_file: "${BAO_SECRET_ID_FILE}"
 approle_mount: "approle"
 token_renew_on_401: true
 
@@ -48,7 +48,7 @@ secret_field: "secret"
 # Set verify_ssl to false ONLY in local development/debug environments.
 # ca_bundle: optional custom CA certificate bundle for self-signed or internal CAs.
 verify_ssl: true
-ca_bundle: "/home/stansfie/openbao/certs/ca.crt"
+ca_bundle: "${BAO_CA_BUNDLE}"
 
 # HTTP request timeout in seconds.
 # Fallback env var: BAO_REQUESTS_TIMEOUT
