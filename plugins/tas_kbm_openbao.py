@@ -310,7 +310,7 @@ def _build_url(
     """
     Validate key_id, safely quote path components, and construct endpoint URL.
 
-    Verifies the resulting URL path remains strictly scoped to the configured mount point.
+    Verifies the resulting URL path remains strictly scoped to the configured mount path.
     """
     _validate_key_id(key_id)
 
@@ -385,6 +385,12 @@ class _OpenBaoClient:
         self,
         url: str = "http://127.0.0.1:8200",
         token: Optional[str] = None,
+        auth_method: str = "token",
+        role_id: Optional[str] = None,
+        secret_id: Optional[str] = None,
+        secret_id_file: Optional[str] = None,
+        approle_mount: str = "approle",
+        token_renew_on_401: bool = True,
         mount_point: str = "secret",
         kv_version: int = 2,
         secret_field: str = "secret",
@@ -398,6 +404,19 @@ class _OpenBaoClient:
     ):
         self.url = url.rstrip("/")
         self.token = token
+        self.auth_method = (auth_method or "token").strip().lower()
+        if self.auth_method not in ("token", "approle"):
+            raise ValueError(
+                f"Invalid auth_method: {self.auth_method!r}. Supported values are 'token' or 'approle'."
+            )
+
+        self.role_id = role_id.strip() if isinstance(role_id, str) else role_id
+        self.secret_id = secret_id
+        self.secret_id_file = secret_id_file
+        self.approle_mount = (approle_mount or "approle").strip("/")
+        self.token_renew_on_401 = token_renew_on_401
+        self._auth_lock = threading.Lock()
+
         self.mount_point = mount_point.strip("/")
         self.kv_version = kv_version
         self.secret_field = secret_field
@@ -414,7 +433,6 @@ class _OpenBaoClient:
         self._pool_semaphore = threading.BoundedSemaphore(value=self.pool_maxsize)
 
         # Configure SSL verify parameter for requests library
-        # verify can be: False (disable verification), True (use system CAs), or str (path to CA bundle)
         if not self.verify_ssl:
             self.verify_param: Any = False
             logger.warning(
@@ -422,7 +440,6 @@ class _OpenBaoClient:
                 "This should only be used for development/debug environments."
             )
         else:
-            # verify_ssl is True: use CA bundle if provided, otherwise use system defaults
             if self.ca_bundle and os.path.isfile(self.ca_bundle):
                 self.verify_param = self.ca_bundle
                 logger.debug(f"Using custom CA bundle: {self.ca_bundle}")
@@ -435,31 +452,17 @@ class _OpenBaoClient:
         if self.token:
             self.session.headers.update({"X-Vault-Token": self.token})
 
-        # Retry strategy
+        # Retry strategy for transient network errors and 5xx responses
         retry_strategy = Retry(
             total=self.retry_total,
             connect=self.retry_total,
             read=self.retry_total,
-            backoff_factor=self.retry_backoff_factor,  # exponential backoff factor for retries
-            status_forcelist=[
-                429,
-                500,
-                502,
-                503,
-                504,
-            ],  # HTTP status codes (429: Rate limits, 500: Internal Server Error, 502: Bad Gateway, 503: Service Unavailable, 504: Gateway Timeout)
+            backoff_factor=self.retry_backoff_factor,
+            status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=frozenset(["GET", "HEAD", "OPTIONS"]),
-            raise_on_status=False,  # allows the application layer to parse non-transient HTTP errors cleanly
+            raise_on_status=False,
         )
 
-        # Connection pool adapter configured with pool_block=True:
-        # - pool_connections: Controls the number of distinct host connection pools cached by urllib3.
-        # - pool_maxsize: Hard upper bound on concurrent connections maintained per host pool.
-        # - pool_block=True: Enforces pool_maxsize as a strict ceiling. When all connections in the
-        #   pool are in use, subsequent connection acquisition requests block until an active connection
-        #   is returned to the pool (or until timeout), preventing connection storms and descriptor churn.
-        # - Process scope: These limits apply per TAS worker process. Total concurrent connections
-        #   to OpenBao across a deployment will be (number of worker processes * pool_maxsize).
         adapter = HTTPAdapter(
             max_retries=retry_strategy,
             pool_connections=self.pool_connections,
@@ -469,14 +472,217 @@ class _OpenBaoClient:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
+        # Validate AppRole requirements and perform initial login if configured
+        if self.auth_method == "approle":
+            if not self.role_id:
+                raise ValueError("role_id is required when auth_method='approle'")
+            if not self.secret_id and not self.secret_id_file:
+                raise ValueError(
+                    "Either secret_id or secret_id_file is required when auth_method='approle'"
+                )
+            self.authenticate()
+
         logger.info(
-            f"OpenBao KBM client initialized for {self.url} (mount: {self.mount_point}, KV v{self.kv_version})"
+            f"OpenBao KBM client initialized for {self.url} "
+            f"(auth: {self.auth_method}, mount: {self.mount_point}, KV v{self.kv_version})"
         )
 
     def close(self) -> None:
         """Close the underlying HTTP session."""
         if self.session:
             self.session.close()
+
+    def _resolve_secret_id(self) -> str:
+        """Resolve Secret ID from secret_id_file or secret_id, with file taking precedence."""
+        if self.secret_id_file:
+            path = os.path.abspath(self.secret_id_file)
+            if not os.path.exists(path):
+                raise ValueError(f"Configured secret_id_file not found: {path}")
+            if not os.path.isfile(path) or not os.access(path, os.R_OK):
+                raise ValueError(
+                    f"Configured secret_id_file is not a readable regular file: {path}"
+                )
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+            except Exception as e:
+                raise ValueError(
+                    f"Failed to read secret_id from secret_id_file '{path}': {e}"
+                ) from e
+            if not content:
+                raise ValueError(f"Configured secret_id_file '{path}' is empty")
+            return content
+
+        if self.secret_id:
+            return self.secret_id
+
+        raise ValueError(
+            "Missing secret_id or secret_id_file for AppRole authentication"
+        )
+
+    def authenticate(self) -> str:
+        """Perform AppRole login to obtain and store a client token."""
+        if not self.role_id:
+            raise ValueError("role_id is required for AppRole authentication")
+
+        secret_id = self._resolve_secret_id()
+
+        endpoint = f"v1/auth/{self.approle_mount}/login"
+        login_url = urljoin(f"{self.url}/", endpoint)
+
+        payload = {
+            "role_id": self.role_id,
+            "secret_id": secret_id,
+        }
+
+        logger.debug(f"Authenticating to OpenBao AppRole endpoint: {endpoint}")
+
+        acquired = self._pool_semaphore.acquire(timeout=self.requests_timeout)
+        if not acquired:
+            logger.error(
+                f"Connection acquisition timed out after {self.requests_timeout}s "
+                f"during AppRole login (pool maxsize: {self.pool_maxsize})"
+            )
+            raise RuntimeError(
+                f"OpenBao connection acquisition timed out after {self.requests_timeout}s "
+                "(connection pool exhausted)"
+            )
+
+        try:
+            resp = self.session.post(
+                login_url,
+                json=payload,
+                verify=self.verify_param,
+                timeout=self.requests_timeout,
+            )
+        except requests.RequestException as e:
+            logger.error(f"Failed to connect to OpenBao at {login_url}: {e}")
+            raise RuntimeError(f"OpenBao connection error: {e}") from e
+        finally:
+            self._pool_semaphore.release()
+
+        if resp.status_code != 200:
+            logger.error(
+                f"OpenBao AppRole login failed ({resp.status_code}): {resp.text}"
+            )
+            raise RuntimeError(
+                f"OpenBao AppRole login failed ({resp.status_code}): {resp.text}"
+            )
+
+        try:
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"Failed to parse OpenBao AppRole login response as JSON: {e}")
+            raise ValueError(f"Malformed OpenBao response payload: {e}") from e
+
+        if not isinstance(data, dict):
+            logger.error(
+                f"Invalid OpenBao response structure: expected JSON object, got {type(data).__name__}"
+            )
+            raise ValueError(
+                f"Invalid OpenBao response structure: expected JSON object, got {type(data).__name__}"
+            )
+
+        auth_data = data.get("auth")
+        if not isinstance(auth_data, dict):
+            logger.error("OpenBao AppRole login response missing 'auth' dictionary")
+            raise ValueError("OpenBao response contains null secret data")
+
+        client_token = auth_data.get("client_token")
+        if not client_token or not isinstance(client_token, str):
+            logger.error("OpenBao AppRole login response missing 'client_token'")
+            raise ValueError("OpenBao response missing client_token in auth")
+
+        self.token = client_token
+        self.session.headers.update({"X-Vault-Token": self.token})
+        logger.info("Successfully authenticated to OpenBao using AppRole")
+        return client_token
+
+    def _execute_request(
+        self,
+        method: str,
+        url: str,
+        **kwargs,
+    ) -> requests.Response:
+        """Execute a single HTTP request bounded by the pool semaphore."""
+        acquired = self._pool_semaphore.acquire(timeout=self.requests_timeout)
+        if not acquired:
+            logger.error(
+                f"Connection acquisition timed out after {self.requests_timeout}s "
+                f"for URL: {url} (pool maxsize: {self.pool_maxsize})"
+            )
+            raise RuntimeError(
+                f"OpenBao connection acquisition timed out after {self.requests_timeout}s "
+                "(connection pool exhausted)"
+            )
+
+        try:
+            if method.upper() == "GET":
+                return self.session.get(
+                    url,
+                    verify=self.verify_param,
+                    timeout=self.requests_timeout,
+                    **kwargs,
+                )
+            elif method.upper() == "POST":
+                return self.session.post(
+                    url,
+                    verify=self.verify_param,
+                    timeout=self.requests_timeout,
+                    **kwargs,
+                )
+            else:
+                return self.session.request(
+                    method,
+                    url,
+                    verify=self.verify_param,
+                    timeout=self.requests_timeout,
+                    **kwargs,
+                )
+        except requests.RequestException as e:
+            logger.error(f"Failed to connect to OpenBao at {url}: {e}")
+            raise RuntimeError(f"OpenBao connection error: {e}") from e
+        finally:
+            self._pool_semaphore.release()
+
+    def _make_request(
+        self,
+        method: str,
+        url: str,
+        **kwargs,
+    ) -> requests.Response:
+        """
+        Execute request with automatic single-retry reauthentication on HTTP 401.
+
+        Uses threading.Lock to serialize reauthentication and ensures concurrent
+        threads reuse newly refreshed tokens.
+        """
+        token_before = self.token
+        resp = self._execute_request(method, url, **kwargs)
+
+        if (
+            resp.status_code == 401
+            and self.auth_method == "approle"
+            and self.token_renew_on_401
+        ):
+            logger.info("OpenBao returned HTTP 401; attempting token reauthentication")
+            with self._auth_lock:
+                # Check whether another thread already refreshed the token
+                if self.token == token_before:
+                    self.authenticate()
+
+            # Retry the request exactly once with refreshed token
+            retry_resp = self._execute_request(method, url, **kwargs)
+            if retry_resp.status_code == 401:
+                logger.error(
+                    f"OpenBao reauthentication retry failed (HTTP 401): {retry_resp.text}"
+                )
+                raise RuntimeError(
+                    "OpenBao reauthentication failed: request returned 401 after token refresh"
+                )
+            return retry_resp
+
+        return resp
 
     def get_secret(self, key_id: str) -> bytes:
         """
@@ -493,29 +699,7 @@ class _OpenBaoClient:
             key_id=key_id,
         )
 
-        # Bound connection checkout: block up to requests_timeout seconds
-        acquired = self._pool_semaphore.acquire(timeout=self.requests_timeout)
-        if not acquired:
-            logger.error(
-                f"Connection acquisition timed out after {self.requests_timeout}s "
-                f"for key_id: {key_id} (pool maxsize: {self.pool_maxsize})"
-            )
-            raise RuntimeError(
-                f"OpenBao connection acquisition timed out after {self.requests_timeout}s "
-                "(connection pool exhausted)"
-            )
-
-        try:
-            resp = self.session.get(
-                url,
-                verify=self.verify_param,
-                timeout=self.requests_timeout,
-            )
-        except requests.RequestException as e:
-            logger.error(f"Failed to connect to OpenBao at {url}: {e}")
-            raise RuntimeError(f"OpenBao connection error: {e}") from e
-        finally:
-            self._pool_semaphore.release()
+        resp = self._make_request("GET", url)
 
         if resp.status_code == 404:
             logger.error(f"Secret not found in OpenBao: {key_id}")
@@ -662,40 +846,81 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
         retry_backoff_factor=retry_backoff_factor,
     )
 
-    # Token precedence: config token -> BAO_TOKEN -> VAULT_TOKEN -> token_file
-    token = (
-        (cfg.get("token") or "").strip()
-        or os.getenv("BAO_TOKEN")
-        or os.getenv("VAULT_TOKEN")
+    # Auth method precedence: config file -> BAO_AUTH_METHOD -> default ('token')
+    raw_auth_method = cfg.get("auth_method") or os.getenv("BAO_AUTH_METHOD") or "token"
+    auth_method = str(raw_auth_method).strip().lower()
+    if auth_method not in ("token", "approle"):
+        raise ValueError(
+            f"Invalid auth_method: {auth_method!r}. Supported values are 'token' or 'approle'."
+        )
+
+    # AppRole configuration parameters
+    role_id = cfg.get("role_id") or os.getenv("BAO_ROLE_ID")
+    if isinstance(role_id, str):
+        role_id = role_id.strip()
+
+    secret_id_file = cfg.get("secret_id_file") or os.getenv("BAO_SECRET_ID_FILE")
+    if isinstance(secret_id_file, str):
+        secret_id_file = secret_id_file.strip()
+
+    secret_id = cfg.get("secret_id") or os.getenv("BAO_SECRET_ID")
+    if isinstance(secret_id, str):
+        secret_id = secret_id.strip()
+
+    approle_mount = (
+        cfg.get("approle_mount") or os.getenv("BAO_APPROLE_MOUNT") or "approle"
     )
 
-    if not token:
-        token_file = (
-            cfg.get("token_file")
-            or os.getenv("BAO_TOKEN_FILE")
-            or os.getenv("VAULT_TOKEN_FILE")
+    raw_token_renew = cfg.get("token_renew_on_401")
+    if raw_token_renew is None:
+        raw_token_renew = os.getenv("BAO_TOKEN_RENEW_ON_401")
+    if raw_token_renew is None:
+        token_renew_on_401 = True
+    else:
+        token_renew_on_401 = _parse_bool(raw_token_renew, "token_renew_on_401")
+
+    # Token precedence: config token -> BAO_TOKEN -> VAULT_TOKEN -> token_file
+    token = None
+    if auth_method == "token":
+        token = (
+            (cfg.get("token") or "").strip()
+            or os.getenv("BAO_TOKEN")
+            or os.getenv("VAULT_TOKEN")
         )
-        if token_file:
-            token_path = os.path.abspath(token_file)
-            if not os.path.exists(token_path):
-                raise ValueError(f"Configured token_file not found: {token_path}")
-            if not os.path.isfile(token_path) or not os.access(token_path, os.R_OK):
-                raise ValueError(
-                    f"Configured token_file is not a readable regular file: {token_path}"
-                )
-            try:
-                with open(token_path, "r", encoding="utf-8") as f:
-                    token = f.read().strip()
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to read token from token_file '{token_path}': {e}"
-                ) from e
-            if not token:
-                raise ValueError(f"Configured token_file '{token_path}' is empty")
+
+        if not token:
+            token_file = (
+                cfg.get("token_file")
+                or os.getenv("BAO_TOKEN_FILE")
+                or os.getenv("VAULT_TOKEN_FILE")
+            )
+            if token_file:
+                token_path = os.path.abspath(token_file)
+                if not os.path.exists(token_path):
+                    raise ValueError(f"Configured token_file not found: {token_path}")
+                if not os.path.isfile(token_path) or not os.access(token_path, os.R_OK):
+                    raise ValueError(
+                        f"Configured token_file is not a readable regular file: {token_path}"
+                    )
+                try:
+                    with open(token_path, "r", encoding="utf-8") as f:
+                        token = f.read().strip()
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to read token from token_file '{token_path}': {e}"
+                    ) from e
+                if not token:
+                    raise ValueError(f"Configured token_file '{token_path}' is empty")
 
     client = _OpenBaoClient(
         url=url,
         token=token,
+        auth_method=auth_method,
+        role_id=role_id,
+        secret_id=secret_id,
+        secret_id_file=secret_id_file,
+        approle_mount=approle_mount,
+        token_renew_on_401=token_renew_on_401,
         mount_point=cfg.get("mount_point", "secret"),
         kv_version=kv_version,
         secret_field=cfg.get("secret_field", "secret"),

@@ -5,12 +5,33 @@
 # Fallback env vars: BAO_ADDR, then VAULT_ADDR. (Dev example: "http://127.0.0.1:8200")
 url: "https://127.0.0.1:8200"
 
-# Authentication Token
+# Authentication Method: "token" (default) or "approle"
+# Fallback env var: BAO_AUTH_METHOD
+auth_method: "approle"
+
+# --- 1. Token Authentication (when auth_method: token) ---
 # Precedence: token -> BAO_TOKEN -> VAULT_TOKEN -> token_file.
 # Pass via env var substitution (default) or hardcode for testing:
-token: "${BAO_TOKEN}"
+# token: "${BAO_TOKEN}"
 # Alternatively, read token from a secure mounted file (e.g., Kubernetes Secret or ramfs):
 # token_file: "/run/secrets/bao_token"
+
+# --- 2. AppRole Authentication (when auth_method: approle) ---
+# role_id: AppRole Role ID (required). Fallback env var: BAO_ROLE_ID
+# secret_id: AppRole Secret ID (optional if secret_id_file is given). Fallback env var: BAO_SECRET_ID
+# secret_id_file: Path to injected Secret ID file (precedence over secret_id). Fallback env var: BAO_SECRET_ID_FILE
+# approle_mount: Auth mount endpoint prefix (default: "approle"). Fallback env var: BAO_APPROLE_MOUNT
+# token_renew_on_401: Automatically reauthenticate on HTTP 401 (default: true). Fallback env var: BAO_TOKEN_RENEW_ON_401
+# Example AppRole configuration:
+# role_id: "${BAO_ROLE_ID}"
+# secret_id: "${BAO_SECRET_ID}"
+# secret_id_file: "/run/secrets/openbao-secret-id"
+# approle_mount: "approle"
+# token_renew_on_401: true
+role_id: "${BAO_ROLE_ID}"
+secret_id_file: "/home/stansfie/openbao/approle/secret_id"
+approle_mount: "approle"
+token_renew_on_401: true
 
 # KV Secrets Engine
 # mount_point: path where the KV engine is mounted (e.g., "secret", "kv")
@@ -27,7 +48,7 @@ secret_field: "secret"
 # Set verify_ssl to false ONLY in local development/debug environments.
 # ca_bundle: optional custom CA certificate bundle for self-signed or internal CAs.
 verify_ssl: true
-ca_bundle: "/opt/openbao/certs/ca.crt"
+ca_bundle: "/home/stansfie/openbao/certs/ca.crt"
 
 # HTTP request timeout in seconds.
 # Fallback env var: BAO_REQUESTS_TIMEOUT

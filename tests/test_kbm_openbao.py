@@ -934,3 +934,356 @@ class TestOpenBaoKBM(unittest.TestCase):
             )
         finally:
             kbm_close_client_connection(client)
+
+    @patch("requests.Session.post")
+    def test_approle_login_success(self, mock_post):
+        """Verify successful AppRole login obtains and configures client token."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "auth": {
+                "client_token": "approle-test-token-12345",
+                "policies": ["default"],
+            }
+        }
+        mock_post.return_value = mock_resp
+
+        client = _OpenBaoClient(
+            auth_method="approle",
+            role_id="my-role-id",
+            secret_id="my-secret-id",
+            approle_mount="approle",
+        )
+
+        self.assertEqual(client.token, "approle-test-token-12345")
+        self.assertEqual(
+            client.session.headers.get("X-Vault-Token"),
+            "approle-test-token-12345",
+        )
+        mock_post.assert_called_once()
+        args, kwargs = mock_post.call_args
+        self.assertTrue(args[0].endswith("/v1/auth/approle/login"))
+        self.assertEqual(
+            kwargs["json"],
+            {"role_id": "my-role-id", "secret_id": "my-secret-id"},
+        )
+        client.close()
+
+    @patch("requests.Session.post")
+    def test_approle_login_failure_raises(self, mock_post):
+        """Verify failed AppRole login raises RuntimeError."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 401
+        mock_resp.text = "invalid role or secret ID"
+        mock_post.return_value = mock_resp
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _OpenBaoClient(
+                auth_method="approle",
+                role_id="bad-role",
+                secret_id="bad-secret",
+            )
+        self.assertIn("AppRole login failed", str(ctx.exception))
+
+    def test_approle_missing_role_id_raises(self):
+        """Verify missing role_id raises ValueError when auth_method=approle."""
+        with self.assertRaises(ValueError) as ctx:
+            _OpenBaoClient(
+                auth_method="approle",
+                role_id=None,
+                secret_id="some-secret",
+            )
+        self.assertIn("role_id is required", str(ctx.exception))
+
+    def test_approle_missing_secret_id_raises(self):
+        """Verify missing secret_id and secret_id_file raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            _OpenBaoClient(
+                auth_method="approle",
+                role_id="some-role",
+                secret_id=None,
+                secret_id_file=None,
+            )
+        self.assertIn("Either secret_id or secret_id_file", str(ctx.exception))
+
+    @patch("requests.Session.post")
+    def test_approle_secret_id_file_reading(self, mock_post):
+        """Verify secret_id is read from secret_id_file."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"auth": {"client_token": "token-from-file"}}
+        mock_post.return_value = mock_resp
+
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write("file-injected-secret-id\n")
+            secret_file_path = tf.name
+
+        try:
+            client = _OpenBaoClient(
+                auth_method="approle",
+                role_id="my-role",
+                secret_id_file=secret_file_path,
+            )
+            self.assertEqual(client.token, "token-from-file")
+            _, kwargs = mock_post.call_args
+            self.assertEqual(kwargs["json"]["secret_id"], "file-injected-secret-id")
+            client.close()
+        finally:
+            os.remove(secret_file_path)
+
+    @patch("requests.Session.post")
+    def test_approle_secret_id_file_precedence_over_secret_id(self, mock_post):
+        """Verify secret_id_file takes precedence over inline secret_id."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"auth": {"client_token": "token-precedence"}}
+        mock_post.return_value = mock_resp
+
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write("priority-secret-id\n")
+            secret_file_path = tf.name
+
+        try:
+            client = _OpenBaoClient(
+                auth_method="approle",
+                role_id="my-role",
+                secret_id="fallback-secret-id",
+                secret_id_file=secret_file_path,
+            )
+            _, kwargs = mock_post.call_args
+            self.assertEqual(kwargs["json"]["secret_id"], "priority-secret-id")
+            client.close()
+        finally:
+            os.remove(secret_file_path)
+
+    def test_approle_empty_secret_id_file_raises(self):
+        """Verify empty secret_id_file raises ValueError."""
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", delete=False) as tf:
+            tf.write("   \n")
+            secret_file_path = tf.name
+
+        try:
+            with self.assertRaises(ValueError) as ctx:
+                _OpenBaoClient(
+                    auth_method="approle",
+                    role_id="my-role",
+                    secret_id_file=secret_file_path,
+                )
+            self.assertIn("empty", str(ctx.exception).lower())
+        finally:
+            os.remove(secret_file_path)
+
+    def test_approle_missing_secret_id_file_raises(self):
+        """Verify non-existent secret_id_file raises ValueError."""
+        with self.assertRaises(ValueError) as ctx:
+            _OpenBaoClient(
+                auth_method="approle",
+                role_id="my-role",
+                secret_id_file="/nonexistent/secret_id_file.txt",
+            )
+        self.assertIn("not found", str(ctx.exception).lower())
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_approle_401_triggers_reauthentication_and_retry(self, mock_get, mock_post):
+        """Verify HTTP 401 triggers reauthentication, updates token, and retries the request."""
+        # Initial login
+        login_resp = MagicMock()
+        login_resp.status_code = 200
+        login_resp.json.return_value = {"auth": {"client_token": "initial-token"}}
+
+        # Renew login after 401
+        renew_resp = MagicMock()
+        renew_resp.status_code = 200
+        renew_resp.json.return_value = {"auth": {"client_token": "renewed-token-456"}}
+        mock_post.side_effect = [login_resp, renew_resp]
+
+        # First request returns 401; retried request returns 200
+        req_401 = MagicMock()
+        req_401.status_code = 401
+        req_401.text = "permission denied: token expired"
+
+        req_200 = MagicMock()
+        req_200.status_code = 200
+        req_200.json.return_value = {
+            "data": {"data": {"secret": "secret-after-renewal"}}
+        }
+        mock_get.side_effect = [req_401, req_200]
+
+        client = _OpenBaoClient(
+            auth_method="approle",
+            role_id="my-role",
+            secret_id="my-secret",
+            token_renew_on_401=True,
+        )
+        self.assertEqual(client.token, "initial-token")
+
+        secret = client.get_secret("my-key")
+        self.assertEqual(secret, b"secret-after-renewal")
+        self.assertEqual(client.token, "renewed-token-456")
+        self.assertEqual(
+            client.session.headers.get("X-Vault-Token"), "renewed-token-456"
+        )
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(mock_post.call_count, 2)
+        client.close()
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_approle_401_retry_failure_raises(self, mock_get, mock_post):
+        """Verify that when a retried request still returns 401, RuntimeError is raised."""
+        login_resp = MagicMock()
+        login_resp.status_code = 200
+        login_resp.json.return_value = {"auth": {"client_token": "initial-token"}}
+        mock_post.return_value = login_resp
+
+        req_401 = MagicMock()
+        req_401.status_code = 401
+        req_401.text = "still unauthorized"
+        mock_get.side_effect = [req_401, req_401]
+
+        client = _OpenBaoClient(
+            auth_method="approle",
+            role_id="my-role",
+            secret_id="my-secret",
+            token_renew_on_401=True,
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            client.get_secret("my-key")
+        self.assertIn("reauthentication failed", str(ctx.exception).lower())
+        client.close()
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_approle_token_renew_on_401_false(self, mock_get, mock_post):
+        """Verify token_renew_on_401=False does not attempt reauthentication."""
+        login_resp = MagicMock()
+        login_resp.status_code = 200
+        login_resp.json.return_value = {"auth": {"client_token": "initial-token"}}
+        mock_post.return_value = login_resp
+
+        req_401 = MagicMock()
+        req_401.status_code = 401
+        req_401.text = "unauthorized"
+        mock_get.return_value = req_401
+
+        client = _OpenBaoClient(
+            auth_method="approle",
+            role_id="my-role",
+            secret_id="my-secret",
+            token_renew_on_401=False,
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            client.get_secret("my-key")
+        self.assertIn("OpenBao API error (401)", str(ctx.exception))
+        # No reauthentication POST was performed beyond startup
+        self.assertEqual(mock_post.call_count, 1)
+        client.close()
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_approle_concurrent_401_single_reauth(self, mock_get, mock_post):
+        """Verify multiple simultaneous 401 responses trigger only a single reauthentication."""
+        login_count = 0
+        lock = threading.Lock()
+
+        def login_handler(*args, **kwargs):
+            nonlocal login_count
+            with lock:
+                login_count += 1
+                curr = login_count
+            time.sleep(0.02)
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"auth": {"client_token": f"token-v{curr}"}}
+            return resp
+
+        mock_post.side_effect = login_handler
+
+        def get_handler(*args, **kwargs):
+            # Check token on incoming request
+            current_token = client.session.headers.get("X-Vault-Token")
+            resp = MagicMock()
+            if current_token == "token-v1":
+                # Simulated expired token returns 401
+                resp.status_code = 401
+                resp.text = "token expired"
+            else:
+                # Refreshed token returns 200
+                resp.status_code = 200
+                resp.json.return_value = {
+                    "data": {"data": {"secret": "concurrent-approle-secret"}}
+                }
+            return resp
+
+        mock_get.side_effect = get_handler
+
+        client = _OpenBaoClient(
+            auth_method="approle",
+            role_id="my-role",
+            secret_id="my-secret",
+            token_renew_on_401=True,
+            pool_maxsize=10,
+        )
+        self.assertEqual(login_count, 1)  # Initial login
+
+        num_threads = 6
+        threads = []
+        results = []
+
+        def worker():
+            try:
+                res = client.get_secret("test-concurrency")
+                results.append(res)
+            except Exception as e:
+                results.append(e)
+
+        for _ in range(num_threads):
+            t = threading.Thread(target=worker)
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(len(results), num_threads)
+        for r in results:
+            self.assertEqual(r, b"concurrent-approle-secret")
+
+        # Total logins: 1 at startup + 1 on 401 surge = 2
+        self.assertEqual(login_count, 2)
+        client.close()
+
+    @patch("requests.Session.post")
+    def test_kbm_open_client_connection_approle_env(self, mock_post):
+        """Verify kbm_open_client_connection initializes AppRole mode from environment variables."""
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "auth": {"client_token": "token-from-env-approle"}
+        }
+        mock_post.return_value = mock_resp
+
+        env_vars = {
+            "BAO_ADDR": "https://127.0.0.1:8200",
+            "BAO_AUTH_METHOD": "approle",
+            "BAO_ROLE_ID": "env-role-123",
+            "BAO_SECRET_ID": "env-secret-456",
+            "BAO_APPROLE_MOUNT": "custom-approle",
+        }
+        with patch.dict(os.environ, env_vars):
+            client = kbm_open_client_connection()
+            self.assertEqual(client.auth_method, "approle")
+            self.assertEqual(client.role_id, "env-role-123")
+            self.assertEqual(client.secret_id, "env-secret-456")
+            self.assertEqual(client.approle_mount, "custom-approle")
+            self.assertEqual(client.token, "token-from-env-approle")
+            kbm_close_client_connection(client)
