@@ -9,14 +9,14 @@ url: "https://127.0.0.1:8200"
 # Fallback env var: BAO_AUTH_METHOD
 auth_method: "approle"
 
-# --- 1. Token Authentication (when auth_method: token) ---
+# Token Authentication (when auth_method: token)
 # Precedence: token -> BAO_TOKEN -> VAULT_TOKEN -> token_file.
 # Pass via env var substitution (default) or hardcode for testing:
 # token: "${BAO_TOKEN}"
 # Alternatively, read token from a secure mounted file (e.g., Kubernetes Secret or ramfs):
 # token_file: "/run/secrets/bao_token"
 
-# --- 2. AppRole Authentication (when auth_method: approle) ---
+# AppRole Authentication (when auth_method: approle)
 # role_id: AppRole Role ID (required). Fallback env var: BAO_ROLE_ID
 # secret_id: AppRole Secret ID (optional if secret_id_file is given). Fallback env var: BAO_SECRET_ID
 # secret_id_file: Path to injected Secret ID file (precedence over secret_id). Fallback env var: BAO_SECRET_ID_FILE
