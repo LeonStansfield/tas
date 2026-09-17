@@ -756,6 +756,8 @@ Example custom plugin without host dependencies:
 ```python
 # plugins/tas_kbm_custom.py
 
+from tas.exceptions import KBMResponseError, KBMUnavailableError
+
 # Declare that this plugin does not need any host-provided kwargs
 KBM_HOST_KWARGS = set()
 
@@ -765,6 +767,13 @@ def kbm_open_client_connection(config_file: str = None):
 
 def kbm_get_secret(client, key_id: str, wrapping_key: bytes):
     # Retrieve secret from your backend
+    try:
+        secret = client.get_secret(key_id)
+    except TimeoutError as exc:
+        raise KBMUnavailableError(retry_after=5) from exc
+    except ValueError as exc:
+        raise KBMResponseError() from exc
+
     # Wrap with provided public key
     return wrapped_secret
 
