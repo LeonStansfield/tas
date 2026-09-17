@@ -16,6 +16,7 @@ import secrets
 from flask import Blueprint, current_app, jsonify, request
 
 from .auth import authenticate_request
+from .exceptions import KBMResponseError, KBMUnavailableError
 from .nonce import store_nonce, validate_nonce
 from .tas_logging import get_logger
 from .tas_vm import vm_verify
@@ -175,6 +176,16 @@ def get_secret():
     except ValueError as e:
         logger.error(f"Secret retrieval failed: {str(e)}")
         return jsonify({"error": "Secret retrieval failed"}), 404
+    except KBMUnavailableError as e:
+        logger.warning("KBM service unavailable", exc_info=True)
+        return (
+            jsonify({"error": e.public_message}),
+            503,
+            {"Retry-After": str(e.retry_after)},
+        )
+    except KBMResponseError as e:
+        logger.error("KBM returned an invalid response", exc_info=True)
+        return jsonify({"error": e.public_message}), 502
 
     # Return the secret
     logger.info(f"Successfully completed secret request for {request.remote_addr}")

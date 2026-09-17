@@ -12,6 +12,12 @@ By contributing, you agree that all code submissions fall under the terms of the
 
 ---
 
+## Developer Guide
+
+For development workflow details, see the [TAS Developer Guide](./docs/DEVELOPERS_GUIDE.md).
+
+---
+
 ## Patch Guidelines
 
 ### Format
