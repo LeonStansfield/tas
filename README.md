@@ -36,14 +36,16 @@ TAS provides:
 
 To get the TAS server running in 5 minutes we recommend using a python virtual environment:
 
+### 1. Clone and setup
 ```bash
-# 1. Clone and setup
 git clone https://github.com/TEE-Attestation/TAS
 cd tas
 python -m venv venv
 source venv/bin/activate
+```
 
-# 2. Install dependencies
+### 2. Install dependencies
+```bash
 git clone https://github.com/TEE-Attestation/sev_pytools.git
 cd sev_pytools
 pip install .
@@ -58,24 +60,61 @@ cd nvidia_pytools
 pip install .
 cd ..
 pip install -r requirements.txt
+```
 
-# 3. Start Redis 6.2+ (required)
+### 3. Start Redis 6.2+ (required)
+```bash
 redis-server &
+```
 
-# 4. Set environment variables
-export TAS_API_KEY="your-64-character-api-key-here-make-it-secure-and-long-enough"
-export TAS_MANAGEMENT_API_KEY="your-64-character-management-key-here-different-from-api-key"
-export TAS_KBM_PLUGIN="tas_kbm_mock"  # Use mock plugin for testing
+### 4. Set environment variables
+Randomly generate keys with `"$(openssl rand -hex 32)"`.use the tas_kbm_mock for dev/testing
+```bash
+export TAS_API_KEY="your-64-character-api-key-here"
+echo "$TAS_API_KEY"
+export TAS_MANAGEMENT_API_KEY="your-64-character-management-key-here"
+echo "$TAS_MANAGEMENT_API_KEY"
+export TAS_KBM_PLUGIN="tas_kbm_mock"
+```
 
-# 5. Create and sign TAS policy
+### 5. Create and Sign a TAS Policy
+
+TAS ships with example policies for two CPU types:
+
+- `sev_example_policy.json` for AMD SEV-SNP
+- `tdx_example_policy.json` for Intel TDX
+
+These example policies are for example and testing. They demonstrate the expected policy format and can be signed and loaded into TAS, but are not production-ready.
+
+For creating and managing your own policies, use the TAS Policy CLI:
+
+https://github.com/TEE-Attestation/tas_policy_cli
+
+The TAS Policy CLI provides tooling to create, validate, update, sign, and upload policies to TAS.
+
+For test/demo deployment, you can sign one of the supplied example policies:
+
+```bash
 cd certs/policy/
-# Using demo signer with auto-generated keys. To generate your own keys, refer https://github.com/TEE-Attestation/tas/blob/main/docs/POLICY.md
-python3 demo_signer.py ./example_policy.json
-# Add signature to your policy
-jq -s '.[0] * .[1]' example_policy.json example_policy.json.sig > example_policy_signed.json
-cd ../..
 
-# 6. Run TAS
+# For AMD SEV-SNP
+python3 demo_signer.py ./sev_example_policy.json
+
+# Add signature to policy
+jq -s '.[0] * .[1]' \
+  sev_example_policy.json \
+  sev_example_policy.json.sig \
+  > sev_example_policy_signed.json
+
+cd ../..
+```
+
+For Intel TDX, replace `sev_example_policy.json` with `tdx_example_policy.json`.
+
+> Note: `demo_signer.py` is for demos and testing purposes only. For production deployments, generate your own signing keys and policies.
+
+### 6. Run TAS
+```bash
 python app.py
 ```
 
