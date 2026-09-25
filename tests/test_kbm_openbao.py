@@ -35,8 +35,10 @@ from plugins.tas_kbm_openbao import (
     _load_rsa_public_key,
     _OpenBaoClient,
     _parse_bool,
+    _read_secret_file,
     _validate_config,
     _validate_key_id,
+    _validate_mount_name,
     kbm_close_client_connection,
     kbm_get_secret,
     kbm_open_client_connection,
@@ -371,7 +373,7 @@ class TestOpenBaoKBM(unittest.TestCase):
             with self.assertRaises(OpenBaoUnavailableError) as ctx:
                 client.get_secret("request-failure")
             self.assertNotIsInstance(ctx.exception, OpenBaoPoolTimeoutError)
-            self.assertIsInstance(ctx.exception.__cause__, ConnectionError)
+            self.assertIsNone(ctx.exception.__cause__)
             self.assertNotIn("request-failure", str(ctx.exception))
         finally:
             kbm_close_client_connection(client)
@@ -412,6 +414,13 @@ class TestOpenBaoKBM(unittest.TestCase):
         self.assertIn("mount_point", cfg)
         self.assertIn("kv_version", cfg)
         self.assertEqual(cfg["url"], "https://127.0.0.1:8200")
+        self.assertIsNone(cfg.get("ca_bundle"))
+        with patch.dict(os.environ, {}, clear=True):
+            client = kbm_open_client_connection(config_path)
+            try:
+                self.assertIs(client.verify_param, True)
+            finally:
+                client.close()
 
     def test_token_file_reading(self):
         """Verify token is correctly read from token_file when env token is not set."""
@@ -427,13 +436,119 @@ class TestOpenBaoKBM(unittest.TestCase):
             config_yaml_path = cf.name
 
         try:
-            with patch.dict(os.environ, {}, clear=True):
+            with patch.dict(os.environ, {"BAO_TOKEN": "environment-token"}, clear=True):
                 client = kbm_open_client_connection(config_yaml_path)
                 self.assertEqual(client.token, "secret-from-token-file")
                 kbm_close_client_connection(client)
         finally:
             os.remove(token_file_path)
             os.remove(config_yaml_path)
+
+    def test_kv_mount_and_string_configuration_validation(self):
+        for mount in ("secret", "kv", "/custom-mount/", "team/kv", "/team/kv/"):
+            with self.subTest(mount=mount):
+                client = _OpenBaoClient(mount_point=mount)
+                try:
+                    self.assertEqual(client.mount_point, mount.strip("/"))
+                finally:
+                    client.close()
+
+        for mount in (
+            "../../sys",
+            "%2e%2e",
+            "%252e%252e",
+            "team//kv",
+            "team/./kv",
+            "team/../kv",
+            r"team\kv",
+            "team?kv",
+            "team#kv",
+        ):
+            with self.subTest(mount=mount), self.assertRaises(ValueError):
+                _OpenBaoClient(mount_point=mount)
+
+        for kwargs in (
+            {"mount_point": ["secret"]},
+            {"secret_field": True},
+            {"token": 123},
+            {"secret_id_file": 123},
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                _OpenBaoClient(**kwargs)
+
+    def test_factory_rejects_invalid_string_configuration(self):
+        invalid_configs = (
+            {"mount_point": ["secret"]},
+            {"secret_field": True},
+            {"token": 123},
+            {"token_file": 123},
+            {"approle_mount": ["approle"]},
+            {"mount_point": "team//kv"},
+            {"approle_mount": "team/../approle"},
+        )
+        for config in invalid_configs:
+            with self.subTest(config=config):
+                with patch(
+                    "plugins.tas_kbm_openbao._load_config_file", return_value=config
+                ):
+                    with self.assertRaises(ValueError):
+                        kbm_open_client_connection("ignored.yaml")
+
+    @patch("requests.Session.post")
+    def test_factory_approle_configuration_precedence_and_fallback(self, mock_post):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"auth": {"client_token": " token "}}
+        mock_post.return_value = response
+        with patch.dict(
+            os.environ,
+            {
+                "BAO_ADDR": "https://bao.example:8200",
+                "BAO_AUTH_METHOD": "token",
+                "BAO_ROLE_ID": "environment-role",
+                "BAO_SECRET_ID": "environment-secret",
+                "BAO_APPROLE_MOUNT": "environment-mount",
+            },
+        ):
+            with patch(
+                "plugins.tas_kbm_openbao._load_config_file",
+                return_value={
+                    "auth_method": "approle",
+                    "role_id": "config-role",
+                    "secret_id": "config-secret",
+                    "approle_mount": "config-mount",
+                },
+            ):
+                client = kbm_open_client_connection("ignored.yaml")
+                try:
+                    self.assertEqual(client.role_id, "config-role")
+                    self.assertEqual(client.approle_mount, "config-mount")
+                    self.assertEqual(
+                        mock_post.call_args.kwargs["json"]["secret_id"],
+                        "config-secret",
+                    )
+                    self.assertEqual(client.token, "token")
+                finally:
+                    client.close()
+
+        mock_post.reset_mock()
+        with patch.dict(
+            os.environ,
+            {
+                "BAO_ADDR": "https://bao.example:8200",
+                "BAO_AUTH_METHOD": "approle",
+                "BAO_ROLE_ID": "environment-role",
+                "BAO_SECRET_ID": "environment-secret",
+                "BAO_APPROLE_MOUNT": "environment-mount",
+            },
+            clear=True,
+        ):
+            with patch("plugins.tas_kbm_openbao._load_config_file", return_value={}):
+                client = kbm_open_client_connection("ignored.yaml")
+                try:
+                    self.assertEqual(client.role_id, "environment-role")
+                    self.assertEqual(client.approle_mount, "environment-mount")
+                finally:
+                    client.close()
 
     def test_validate_key_id_positive(self):
         """Verify valid key_id patterns pass validation without error."""
@@ -503,6 +618,21 @@ class TestOpenBaoKBM(unittest.TestCase):
             url_v1,
             "http://127.0.0.1:8200/v1/secret/customer/app%20key",
         )
+
+        for kv_version, suffix in (
+            (1, "team/kv/customer/app"),
+            (2, "team/kv/data/customer/app"),
+        ):
+            with self.subTest(kv_version=kv_version):
+                self.assertEqual(
+                    _build_url(
+                        base_url="http://127.0.0.1:8200",
+                        mount_point="team/kv",
+                        kv_version=kv_version,
+                        key_id="customer/app",
+                    ),
+                    f"http://127.0.0.1:8200/v1/{suffix}",
+                )
 
     def test_parse_bool_valid(self):
         """Verify valid truthy and falsy boolean inputs."""
@@ -936,9 +1066,7 @@ class TestOpenBaoKBM(unittest.TestCase):
                 str(ctx.exception), "Secret service is temporarily unavailable"
             )
             self.assertNotIsInstance(ctx.exception, OpenBaoPoolTimeoutError)
-            cause = ctx.exception.__cause__
-            self.assertIsInstance(cause, ConnectionError)
-            self.assertIn("Pool is full", str(cause))
+            self.assertIsNone(ctx.exception.__cause__)
 
         client.close()
 
@@ -1036,3 +1164,438 @@ class TestOpenBaoKBM(unittest.TestCase):
                 ):
                     with self.assertRaises(ValueError):
                         kbm_open_client_connection()
+
+    @patch("requests.Session.post")
+    def test_approle_login_sets_token_and_uses_expected_request(self, mock_post):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"auth": {"client_token": " client-token "}}
+        mock_post.return_value = response
+        client = _OpenBaoClient(
+            url="https://bao.example:8200",
+            auth_method="approle",
+            role_id="role-id",
+            secret_id="secret-id",
+        )
+        try:
+            mock_post.assert_called_once_with(
+                "https://bao.example:8200/v1/auth/approle/login",
+                verify=True,
+                timeout=30,
+                allow_redirects=False,
+                json={"role_id": "role-id", "secret_id": "secret-id"},
+            )
+            self.assertEqual(client.token, "client-token")
+            self.assertEqual(client.session.headers["X-Vault-Token"], "client-token")
+        finally:
+            client.close()
+
+    def test_approle_constructor_requires_credentials_and_valid_types(self):
+        cases = [
+            {"auth_method": "approle"},
+            {"auth_method": "approle", "role_id": "role"},
+            {"auth_method": 1},
+            {"auth_method": "approle", "role_id": 1, "secret_id": "secret"},
+            {
+                "auth_method": "approle",
+                "role_id": "role",
+                "secret_id": "secret",
+                "token_renew_on_401": 1,
+            },
+        ]
+        for kwargs in cases:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                _OpenBaoClient(url="https://bao.example:8200", **kwargs)
+
+    @patch("requests.Session.post")
+    def test_approle_login_rejects_whitespace_and_non_string_tokens(self, mock_post):
+        for token in ("", "   ", 123):
+            response = MagicMock(status_code=200)
+            response.json.return_value = {"auth": {"client_token": token}}
+            mock_post.return_value = response
+            with self.subTest(token=token), self.assertRaises(OpenBaoResponseError):
+                _OpenBaoClient(
+                    url="https://bao.example:8200",
+                    auth_method="approle",
+                    role_id="role-id",
+                    secret_id="secret-id",
+                )
+
+    def test_factory_rejects_invalid_renewal_configuration(self):
+        with patch(
+            "plugins.tas_kbm_openbao._load_config_file",
+            return_value={"token_renew_on_401": "maybe"},
+        ):
+            with self.assertRaises(ValueError):
+                kbm_open_client_connection("ignored.yaml")
+
+    def test_approle_mount_validation(self):
+        self.assertEqual(
+            _validate_mount_name("/custom-mount/", "approle_mount"), "custom-mount"
+        )
+        self.assertEqual(_validate_mount_name("team/approle"), "team/approle")
+        for value in (
+            "",
+            ".",
+            "..",
+            "a//b",
+            "a/./b",
+            "a/../b",
+            "a?b",
+            "a#b",
+            r"a\b",
+            "%2e%2e",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                _validate_mount_name(value, "approle_mount")
+
+    @patch("plugins.tas_kbm_openbao.logger")
+    @patch("requests.Session.get")
+    def test_backend_logs_omit_sensitive_identifiers(self, mock_get, mock_logger):
+        key_id = "private-key-id"
+        secret_field = "private-secret-field"
+        responses = []
+        for payload in (
+            {"data": {"data": {"other": "value"}}},
+            {"data": {"data": None}},
+            {"data": {"data": ["invalid"]}},
+        ):
+            response = MagicMock(status_code=200)
+            response.json.return_value = payload
+            responses.append(response)
+        mock_get.side_effect = responses
+        client = _OpenBaoClient(secret_field=secret_field)
+        try:
+            for _ in responses:
+                with self.assertRaises((ValueError, OpenBaoResponseError)):
+                    client.get_secret(key_id)
+            messages = " ".join(
+                str(call.args[0])
+                for call in mock_logger.error.call_args_list
+                if call.args
+            )
+            self.assertNotIn(key_id, messages)
+            self.assertNotIn(secret_field, messages)
+        finally:
+            client.close()
+
+    @patch("requests.Session.post")
+    def test_approle_secret_file_takes_precedence(self, mock_post):
+        import tempfile
+
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"auth": {"client_token": "client-token"}}
+        mock_post.return_value = response
+        with tempfile.NamedTemporaryFile("w", delete=False) as secret_file:
+            secret_file.write("file-secret\n")
+            path = secret_file.name
+        try:
+            client = _OpenBaoClient(
+                url="https://bao.example:8200",
+                auth_method="approle",
+                role_id="role-id",
+                secret_id="inline-secret",
+                secret_id_file=path,
+            )
+            try:
+                self.assertEqual(
+                    mock_post.call_args.kwargs["json"]["secret_id"], "file-secret"
+                )
+            finally:
+                client.close()
+        finally:
+            os.remove(path)
+
+    def test_secret_id_file_rejects_directory_and_empty_file(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                _read_secret_file(directory, "secret_id_file")
+        with tempfile.NamedTemporaryFile("w", delete=False) as secret_file:
+            path = secret_file.name
+        try:
+            with self.assertRaises(ValueError):
+                _read_secret_file(path, "secret_id_file")
+        finally:
+            os.remove(path)
+
+    def test_secret_id_file_rejects_symlink(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = os.path.join(directory, "secret")
+            link = os.path.join(directory, "secret-link")
+            with open(target, "w", encoding="utf-8") as secret_file:
+                secret_file.write("secret")
+            os.symlink(target, link)
+            with self.assertRaises(ValueError):
+                _read_secret_file(link, "secret_id_file")
+
+    @patch("requests.Session.post")
+    def test_approle_login_status_classification(self, mock_post):
+        for status in (401, 403, 418):
+            response = MagicMock(status_code=status)
+            mock_post.return_value = response
+            with self.subTest(status=status), self.assertRaises(OpenBaoResponseError):
+                _OpenBaoClient(
+                    url="https://bao.example:8200",
+                    auth_method="approle",
+                    role_id="role-id",
+                    secret_id="secret-id",
+                )
+        for status in (429, 500, 502, 503, 504):
+            response = MagicMock(status_code=status)
+            mock_post.return_value = response
+            with (
+                self.subTest(status=status),
+                self.assertRaises(OpenBaoUnavailableError),
+            ):
+                _OpenBaoClient(
+                    url="https://bao.example:8200",
+                    auth_method="approle",
+                    role_id="role-id",
+                    secret_id="secret-id",
+                )
+
+    @patch("requests.Session.post")
+    def test_failed_approle_initialization_closes_session(self, mock_post):
+        mock_post.side_effect = ConnectionError(
+            "https://role-id:secret-id@bao.example/login"
+        )
+        with patch.object(requests.Session, "close") as mock_close:
+            with self.assertRaises(OpenBaoUnavailableError) as context:
+                _OpenBaoClient(
+                    url="https://bao.example:8200",
+                    auth_method="approle",
+                    role_id="role-id",
+                    secret_id="secret-id",
+                )
+        mock_close.assert_called_once()
+        self.assertNotIn("role-id", str(context.exception))
+        self.assertNotIn("secret-id", str(context.exception))
+
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_approle_401_renews_token_before_retry(self, mock_post, mock_get):
+        login_response = MagicMock(status_code=200)
+        login_response.json.return_value = {"auth": {"client_token": "token-a"}}
+        renew_response = MagicMock(status_code=200)
+        renew_response.json.return_value = {"auth": {"client_token": "token-b"}}
+        mock_post.side_effect = [login_response, renew_response]
+        first = MagicMock(status_code=401)
+        second = MagicMock(status_code=200)
+        second.json.return_value = {"data": {"data": {"secret": "value"}}}
+        mock_get.side_effect = [first, second]
+        client = _OpenBaoClient(
+            url="https://bao.example:8200",
+            auth_method="approle",
+            role_id="role-id",
+            secret_id="secret-id",
+        )
+        try:
+            client.get_secret("key")
+            self.assertEqual(mock_post.call_count, 2)
+            self.assertTrue(
+                mock_post.call_args_list[1]
+                .args[0]
+                .endswith("/v1/auth/token/renew-self")
+            )
+            self.assertNotIn("json", mock_post.call_args_list[1].kwargs)
+            self.assertEqual(mock_get.call_count, 2)
+            self.assertEqual(client.token, "token-b")
+        finally:
+            client.close()
+
+    @patch("requests.Session.post")
+    def test_nested_approle_mount_login_url(self, mock_post):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"auth": {"client_token": "token-a"}}
+        mock_post.return_value = response
+        client = _OpenBaoClient(
+            url="https://bao.example:8200",
+            auth_method="approle",
+            role_id="role-id",
+            secret_id="secret-id",
+            approle_mount="team/approle",
+        )
+        try:
+            self.assertEqual(
+                mock_post.call_args.args[0],
+                "https://bao.example:8200/v1/auth/team/approle/login",
+            )
+        finally:
+            client.close()
+
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_renewal_rejection_falls_back_to_approle_once(self, mock_post, mock_get):
+        initial_login = MagicMock(status_code=200)
+        initial_login.json.return_value = {"auth": {"client_token": "token-a"}}
+        renewal_rejected = MagicMock(status_code=403)
+        fallback_login = MagicMock(status_code=200)
+        fallback_login.json.return_value = {"auth": {"client_token": "token-b"}}
+        mock_post.side_effect = [initial_login, renewal_rejected, fallback_login]
+        mock_get.side_effect = [MagicMock(status_code=401), MagicMock(status_code=401)]
+        client = _OpenBaoClient(
+            url="https://bao.example:8200",
+            auth_method="approle",
+            role_id="role-id",
+            secret_id="secret-id",
+        )
+        try:
+            with self.assertRaises(OpenBaoResponseError):
+                client._make_request("GET", "https://bao.example:8200/v1/key")
+            self.assertEqual(mock_post.call_count, 3)
+            self.assertEqual(mock_get.call_count, 2)
+            self.assertEqual(
+                mock_post.call_args_list[1].args[0],
+                "https://bao.example:8200/v1/auth/token/renew-self",
+            )
+            self.assertNotIn("json", mock_post.call_args_list[1].kwargs)
+        finally:
+            client.close()
+
+    @patch("requests.Session.post")
+    def test_static_token_mode_never_logs_in(self, mock_post):
+        client = _OpenBaoClient(url="https://bao.example:8200", token="static-token")
+        try:
+            self.assertEqual(mock_post.call_count, 0)
+            self.assertEqual(client.session.headers["X-Vault-Token"], "static-token")
+        finally:
+            client.close()
+
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_401_renewal_disabled_returns_original_response(self, mock_post, mock_get):
+        login_response = MagicMock(status_code=200)
+        login_response.json.return_value = {"auth": {"client_token": "token-a"}}
+        mock_post.return_value = login_response
+        mock_get.return_value = MagicMock(status_code=401)
+        client = _OpenBaoClient(
+            url="https://bao.example:8200",
+            auth_method="approle",
+            role_id="role-id",
+            secret_id="secret-id",
+            token_renew_on_401=False,
+        )
+        try:
+            response = client._make_request(
+                "GET", "https://bao.example:8200/v1/secret/data/key"
+            )
+            self.assertEqual(response.status_code, 401)
+            self.assertEqual(mock_post.call_count, 1)
+            self.assertEqual(mock_get.call_count, 1)
+        finally:
+            client.close()
+
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_second_401_does_not_trigger_another_login(self, mock_post, mock_get):
+        login_response = MagicMock(status_code=200)
+        login_response.json.return_value = {"auth": {"client_token": "token-b"}}
+        mock_post.return_value = login_response
+        mock_get.side_effect = [MagicMock(status_code=401), MagicMock(status_code=401)]
+        client = _OpenBaoClient(
+            url="https://bao.example:8200",
+            auth_method="approle",
+            role_id="role-id",
+            secret_id="secret-id",
+        )
+        try:
+            with self.assertRaises(OpenBaoResponseError):
+                client._make_request(
+                    "GET", "https://bao.example:8200/v1/secret/data/key"
+                )
+            self.assertEqual(mock_post.call_count, 2)
+            self.assertEqual(mock_get.call_count, 2)
+        finally:
+            client.close()
+
+    @patch("requests.Session.post")
+    def test_login_rejects_malformed_success_payloads(self, mock_post):
+        for payload in (
+            {},
+            {"auth": {}},
+            {"auth": {"client_token": 1}},
+            {"auth": {"client_token": ""}},
+        ):
+            response = MagicMock(status_code=200)
+            response.json.return_value = payload
+            mock_post.return_value = response
+            with self.subTest(payload=payload), self.assertRaises(OpenBaoResponseError):
+                _OpenBaoClient(
+                    url="https://bao.example:8200",
+                    auth_method="approle",
+                    role_id="role-id",
+                    secret_id="secret-id",
+                )
+
+    def test_credential_bearing_url_is_rejected_without_leaking_credentials(self):
+        with self.assertRaises(ValueError) as context:
+            _validate_config(
+                url="https://user:password@bao.example:8200",
+                verify_ssl=True,
+                ca_bundle=None,
+                kv_version=2,
+                requests_timeout=30,
+                pool_connections=1,
+                pool_maxsize=1,
+                retry_total=0,
+                retry_backoff_factor=0,
+            )
+        self.assertNotIn("user", str(context.exception))
+        self.assertNotIn("password", str(context.exception))
+
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_concurrent_401_requests_share_one_refresh(self, mock_post, mock_get):
+        from concurrent.futures import ThreadPoolExecutor
+
+        login = MagicMock(status_code=200)
+        login.json.return_value = {"auth": {"client_token": "same-token"}}
+        renew = MagicMock(status_code=200)
+        renew.json.return_value = {"auth": {"client_token": "same-token"}}
+        mock_post.side_effect = [login, renew]
+        barrier = threading.Barrier(4)
+        request_tokens = []
+        request_counts = []
+        request_lock = threading.Lock()
+        thread_state = threading.local()
+
+        def get_secret_response(*args, **kwargs):
+            thread_state.request_count = getattr(thread_state, "request_count", 0) + 1
+            with request_lock:
+                request_tokens.append(client.session.headers.get("X-Vault-Token"))
+                request_counts.append(thread_state.request_count)
+            if thread_state.request_count == 1:
+                barrier.wait(timeout=5)
+                return MagicMock(status_code=401)
+            return MagicMock(
+                status_code=200,
+                json=lambda: {"data": {"data": {"secret": "value"}}},
+            )
+
+        mock_get.side_effect = get_secret_response
+        client = _OpenBaoClient(
+            url="https://bao.example:8200",
+            auth_method="approle",
+            role_id="role-id",
+            secret_id="secret-id",
+        )
+
+        def worker():
+            barrier.wait()
+            return client.get_secret("key")
+
+        try:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                results = list(executor.map(lambda _: worker(), range(4)))
+            self.assertEqual(results, [b"value"] * 4)
+            self.assertEqual(mock_post.call_count, 2)
+            self.assertEqual(mock_get.call_count, 8)
+            self.assertEqual(client.session.headers["X-Vault-Token"], "same-token")
+            self.assertEqual(request_tokens, ["same-token"] * 8)
+            self.assertEqual(sorted(request_counts), [1, 1, 1, 1, 2, 2, 2, 2])
+            self.assertEqual(client._pool_semaphore._value, client.pool_maxsize)
+        finally:
+            client.close()

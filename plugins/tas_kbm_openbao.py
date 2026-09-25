@@ -12,12 +12,14 @@
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import math
 import os
 import posixpath
 import re
 import secrets as _secrets
+import stat
 import threading
 from typing import Any, Dict, Optional
 from urllib.parse import quote, urljoin, urlparse
@@ -199,18 +201,11 @@ def _validate_config(
             "OpenBao URL is required. Specify 'url' in configuration or set BAO_ADDR/VAULT_ADDR."
         )
 
-    # Validate URL scheme
+    url = _validate_base_url(url)
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError(
-            f"Invalid OpenBao URL '{url}': URL must include a valid scheme ('http' or 'https') and host."
-        )
 
     if parsed.scheme == "http" and verify_ssl:
-        raise ValueError(
-            f"Insecure scheme 'http://' is not permitted when verify_ssl=True. "
-            f"Use HTTPS or set verify_ssl=False for local development environments."
-        )
+        raise ValueError("Insecure OpenBao URL is not permitted when verify_ssl=True")
 
     # Validate CA bundle
     if ca_bundle:
@@ -277,6 +272,60 @@ def _validate_config(
 
 
 # Validation and URL Safety Helpers
+
+
+def _validate_base_url(url: str) -> str:
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("OpenBao URL must be a non-empty string")
+    normalized = url.strip().rstrip("/")
+    try:
+        parsed = urlparse(normalized)
+        valid_port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Invalid OpenBao URL port") from exc
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(
+            "Invalid OpenBao URL: URL must include an http(s) scheme and host"
+        )
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError(
+            "Invalid OpenBao URL: credentials, query strings, and fragments are not allowed"
+        )
+    if valid_port is not None and not 1 <= valid_port <= 65535:
+        raise ValueError("Invalid OpenBao URL port")
+    return normalized
+
+
+def _read_secret_file(path: str, name: str) -> str:
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise ValueError(f"Configured {name} not found") from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise ValueError(f"Configured {name} must not be a symlink") from exc
+        raise ValueError(f"Configured {name} is not accessible") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"Configured {name} is not a readable regular file")
+        with os.fdopen(fd, "r", encoding="utf-8") as secret_file:
+            fd = -1
+            value = secret_file.read().strip()
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"Configured {name} could not be decoded") from exc
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError(f"Failed to read configured {name}") from exc
+    finally:
+        if fd != -1:
+            os.close(fd)
+    if not value:
+        raise ValueError(f"Configured {name} is empty")
+    return value
 
 
 def _validate_key_id(key_id: str) -> None:
@@ -379,6 +428,34 @@ def _parse_bool(value: Any, name: str = "value") -> bool:
     )
 
 
+def _validate_mount_name(value: str, name: str = "mount") -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    normalized = value.strip("/")
+    if not normalized:
+        raise ValueError(f"{name} must be a non-empty mount name")
+    if any(ord(c) < 32 or ord(c) == 127 for c in normalized):
+        raise ValueError(f"{name} contains control characters")
+    if re.search(r"(?i)%(?:25)*(?:2e|2f|5c)", normalized):
+        raise ValueError(f"{name} contains encoded traversal")
+    segments = normalized.split("/")
+    for segment in segments:
+        if segment in ("", ".", ".."):
+            raise ValueError(f"{name} contains an invalid path segment")
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", segment):
+            raise ValueError(f"{name} contains invalid characters")
+    return normalized
+
+
+def _normalize_optional_string(value: Any, name: str) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string or None")
+    normalized = value.strip()
+    return normalized or None
+
+
 __all__ = [
     # Public KBM plugin API
     "kbm_open_client_connection",
@@ -432,10 +509,33 @@ class _OpenBaoClient:
         retry_backoff_factor: float = 0.05,
         pool_connections: int = 10,
         pool_maxsize: int = 20,
+        auth_method: str = "token",
+        role_id: Optional[str] = None,
+        secret_id: Optional[str] = None,
+        secret_id_file: Optional[str] = None,
+        approle_mount: str = "approle",
+        token_renew_on_401: bool = True,
     ):
-        self.url = url.rstrip("/")
+        url = _normalize_optional_string(url, "url")
+        if not url:
+            raise ValueError("url must be a non-empty string")
+        auth_method = _normalize_optional_string(auth_method, "auth_method")
+        if not auth_method:
+            raise ValueError("auth_method must be a non-empty string")
+        if not isinstance(token_renew_on_401, bool):
+            raise ValueError("token_renew_on_401 must be a boolean")
+        role_id = _normalize_optional_string(role_id, "role_id")
+        secret_id = _normalize_optional_string(secret_id, "secret_id")
+        secret_id_file = _normalize_optional_string(secret_id_file, "secret_id_file")
+        token = _normalize_optional_string(token, "token")
+        mount_point = _validate_mount_name(mount_point, "mount_point")
+        secret_field = _normalize_optional_string(secret_field, "secret_field")
+        if not secret_field:
+            raise ValueError("secret_field must be a non-empty string")
+        approle_mount = _validate_mount_name(approle_mount, "approle_mount")
+        self.url = _validate_base_url(url)
         self.token = token
-        self.mount_point = mount_point.strip("/")
+        self.mount_point = mount_point
         self.kv_version = kv_version
         self.secret_field = secret_field
         self.verify_ssl = verify_ssl
@@ -445,6 +545,28 @@ class _OpenBaoClient:
         self.retry_backoff_factor = retry_backoff_factor
         self.pool_connections = pool_connections
         self.pool_maxsize = pool_maxsize
+        self.auth_method = (
+            auth_method.strip().lower() if isinstance(auth_method, str) else auth_method
+        )
+        if self.auth_method not in ("token", "approle"):
+            raise ValueError("auth_method must be 'token' or 'approle'")
+        self.role_id = role_id
+        self.secret_id = secret_id
+        self.secret_id_file = secret_id_file
+        self.approle_mount = approle_mount
+        self.token_renew_on_401 = token_renew_on_401
+        self._token_generation = 0
+        if self.auth_method == "approle" and not self.role_id:
+            raise ValueError("role_id is required for AppRole authentication")
+        if (
+            self.auth_method == "approle"
+            and not self.secret_id
+            and not self.secret_id_file
+        ):
+            raise ValueError(
+                "secret_id or secret_id_file is required for AppRole authentication"
+            )
+        self._reauth_lock = threading.Lock()
 
         # Bounded semaphore to strictly bound connection acquisition queue times.
         # This prevents threads from blocking indefinitely when pool_maxsize is reached.
@@ -506,8 +628,19 @@ class _OpenBaoClient:
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
 
+        try:
+            if self.auth_method == "approle":
+                self._login_approle()
+        except Exception:
+            self.token = None
+            self.session.headers.pop("X-Vault-Token", None)
+            self.session.close()
+            raise
+
         logger.info(
-            f"OpenBao KBM client initialized for {self.url} (mount: {self.mount_point}, KV v{self.kv_version})"
+            "OpenBao KBM client initialized "
+            f"(scheme: {urlparse(self.url).scheme}, host: {urlparse(self.url).hostname}, "
+            f"port: {urlparse(self.url).port}, mount: {self.mount_point}, KV v{self.kv_version})"
         )
 
     def close(self) -> None:
@@ -515,57 +648,121 @@ class _OpenBaoClient:
         if self.session:
             self.session.close()
 
+    def _execute_request(
+        self, method: str, url: str, **kwargs: Any
+    ) -> requests.Response:
+        acquired = self._pool_semaphore.acquire(timeout=self.requests_timeout)
+        if not acquired:
+            raise OpenBaoPoolTimeoutError()
+        try:
+            request_method = getattr(self.session, method.lower())
+            return request_method(
+                url,
+                verify=self.verify_param,
+                timeout=self.requests_timeout,
+                allow_redirects=False,
+                **kwargs,
+            )
+        except requests.RequestException:
+            logger.error("OpenBao request failed")
+            raise OpenBaoUnavailableError() from None
+        finally:
+            self._pool_semaphore.release()
+
+    def _login_approle(self) -> None:
+        secret_id = (
+            _read_secret_file(self.secret_id_file, "secret_id_file")
+            if self.secret_id_file
+            else self.secret_id
+        )
+        url = f"{self.url}/v1/auth/{self.approle_mount}/login"
+        response = self._execute_request(
+            "POST", url, json={"role_id": self.role_id, "secret_id": secret_id}
+        )
+        if response.status_code in (429, 500, 502, 503, 504):
+            raise OpenBaoUnavailableError()
+        if response.status_code in (401, 403):
+            raise OpenBaoResponseError()
+        if response.status_code != 200:
+            raise OpenBaoResponseError()
+        try:
+            payload = response.json()
+        except Exception:
+            raise OpenBaoResponseError() from None
+        auth = payload.get("auth") if isinstance(payload, dict) else None
+        token = auth.get("client_token") if isinstance(auth, dict) else None
+        if not isinstance(token, str) or not token.strip():
+            raise OpenBaoResponseError()
+        self.token = token.strip()
+        self.session.headers.update({"X-Vault-Token": self.token})
+        self._token_generation += 1
+
+    def _make_request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
+        token_generation = self._token_generation
+        response = self._execute_request(method, url, **kwargs)
+        if (
+            response.status_code != 401
+            or self.auth_method != "approle"
+            or not self.token_renew_on_401
+        ):
+            return response
+        with self._reauth_lock:
+            if self._token_generation == token_generation:
+                if not self._renew_token():
+                    self._login_approle()
+        response = self._execute_request(method, url, **kwargs)
+        if response.status_code == 401:
+            raise OpenBaoResponseError()
+        return response
+
+    def _renew_token(self) -> bool:
+        response = self._execute_request("POST", f"{self.url}/v1/auth/token/renew-self")
+        if response.status_code in (429, 500, 502, 503, 504):
+            raise OpenBaoUnavailableError()
+        if response.status_code in (400, 401, 403, 404):
+            return False
+        if response.status_code != 200:
+            raise OpenBaoResponseError()
+        try:
+            payload = response.json()
+        except (TypeError, ValueError):
+            raise OpenBaoResponseError() from None
+        auth = payload.get("auth") if isinstance(payload, dict) else None
+        token = auth.get("client_token") if isinstance(auth, dict) else None
+        if not isinstance(token, str) or not token.strip():
+            raise OpenBaoResponseError()
+        self.token = token
+        self.session.headers.update({"X-Vault-Token": token})
+        self._token_generation += 1
+        return True
+
     def get_secret(self, key_id: str) -> bytes:
         """
         Retrieve secret bytes for the given key_id from OpenBao via REST API.
 
         Supports both KV version 1 and KV version 2 engines.
         """
-        logger.debug(f"Fetching secret from OpenBao for key_id: {key_id}")
-
         url = _build_url(
             base_url=self.url,
             mount_point=self.mount_point,
             kv_version=self.kv_version,
             key_id=key_id,
         )
+        logger.debug("Fetching secret from OpenBao for validated key_id")
 
-        # Bound connection checkout: block up to requests_timeout seconds
-        acquired = self._pool_semaphore.acquire(timeout=self.requests_timeout)
-        if not acquired:
-            logger.error(
-                f"Connection acquisition timed out after {self.requests_timeout}s "
-                f"for key_id: {key_id} (pool maxsize: {self.pool_maxsize})"
-            )
-            raise OpenBaoPoolTimeoutError()
-
-        try:
-            resp = self.session.get(
-                url,
-                verify=self.verify_param,
-                timeout=self.requests_timeout,
-            )
-        except requests.RequestException as exc:
-            logger.error("OpenBao request failed", exc_info=True)
-            raise OpenBaoUnavailableError() from exc
-        finally:
-            self._pool_semaphore.release()
+        resp = self._make_request("GET", url)
 
         if resp.status_code == 404:
-            logger.error(f"Secret not found in OpenBao: {key_id}")
+            logger.error("Secret not found in OpenBao")
             raise ValueError("Secret not found")
         elif resp.status_code != 200:
-            logger.error(
-                f"OpenBao secret retrieval failed ({resp.status_code}) for key_id {key_id}: {resp.text}"
-            )
+            logger.error(f"OpenBao secret retrieval failed ({resp.status_code})")
             raise OpenBaoResponseError()
 
         try:
             payload = resp.json()
         except Exception as e:
-            logger.error(
-                f"Failed to parse OpenBao response as JSON for key_id {key_id}: {e}"
-            )
+            logger.error("Failed to parse OpenBao response as JSON")
             raise OpenBaoResponseError() from e
 
         if not isinstance(payload, dict):
@@ -585,21 +782,17 @@ class _OpenBaoClient:
             data = payload.get("data")
 
         if data is None:
-            logger.error(
-                f"OpenBao response contains null secret data for key_id: {key_id}"
-            )
+            logger.error("OpenBao response contains null secret data")
             raise OpenBaoResponseError()
 
         if not isinstance(data, dict):
             logger.error(
-                f"Invalid OpenBao response structure for key_id {key_id}: expected secret data dictionary, got {type(data).__name__}"
+                f"Invalid OpenBao response structure: expected secret data dictionary, got {type(data).__name__}"
             )
             raise OpenBaoResponseError()
 
         if self.secret_field not in data:
-            logger.error(
-                f"Secret field '{self.secret_field}' not found in OpenBao secret data for key_id: {key_id}"
-            )
+            logger.error("Configured secret field not found in OpenBao secret data")
             raise ValueError("Secret field not found in OpenBao secret data")
 
         val = data[self.secret_field]
@@ -694,7 +887,10 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
         return f_val
 
     # Resolve connection & security parameters
-    url = cfg.get("url") or os.getenv("BAO_ADDR") or os.getenv("VAULT_ADDR")
+    url = cfg.get("url")
+    if url is None:
+        url = os.getenv("BAO_ADDR") or os.getenv("VAULT_ADDR")
+    url = _normalize_optional_string(url, "url")
 
     raw_verify_ssl = cfg.get("verify_ssl")
     if raw_verify_ssl is None:
@@ -706,9 +902,10 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
     else:
         verify_ssl = _parse_bool(raw_verify_ssl, "verify_ssl")
 
-    ca_bundle = (
-        cfg.get("ca_bundle") or os.getenv("BAO_CA_BUNDLE") or os.getenv("VAULT_CACERT")
-    )
+    ca_bundle = cfg.get("ca_bundle")
+    if ca_bundle is None:
+        ca_bundle = os.getenv("BAO_CA_BUNDLE") or os.getenv("VAULT_CACERT")
+    ca_bundle = _normalize_optional_string(ca_bundle, "ca_bundle")
 
     # Resolve engine, timeouts, pool and retry settings
     kv_version = _get_required_int("kv_version", "BAO_KV_VERSION", 2)
@@ -733,43 +930,75 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
         retry_backoff_factor=retry_backoff_factor,
     )
 
-    # Token precedence: config token -> BAO_TOKEN -> VAULT_TOKEN -> token_file
-    token = (
-        (cfg.get("token") or "").strip()
-        or os.getenv("BAO_TOKEN")
-        or os.getenv("VAULT_TOKEN")
-    )
-
-    if not token:
-        token_file = (
-            cfg.get("token_file")
-            or os.getenv("BAO_TOKEN_FILE")
-            or os.getenv("VAULT_TOKEN_FILE")
-        )
-        if token_file:
-            token_path = os.path.abspath(token_file)
-            if not os.path.exists(token_path):
-                raise ValueError(f"Configured token_file not found: {token_path}")
-            if not os.path.isfile(token_path) or not os.access(token_path, os.R_OK):
-                raise ValueError(
-                    f"Configured token_file is not a readable regular file: {token_path}"
+    raw_auth_method = cfg.get("auth_method")
+    if raw_auth_method is None:
+        raw_auth_method = os.getenv("BAO_AUTH_METHOD")
+    if raw_auth_method is None:
+        raw_auth_method = "token"
+    if not isinstance(raw_auth_method, str):
+        raise ValueError("auth_method must be a string")
+    auth_method = raw_auth_method.strip().lower()
+    if auth_method not in ("token", "approle"):
+        raise ValueError("auth_method must be 'token' or 'approle'")
+    token = None
+    role_id = secret_id = secret_id_file = None
+    if auth_method == "token":
+        token = _normalize_optional_string(cfg.get("token"), "token")
+        if token is None:
+            token_file = _normalize_optional_string(cfg.get("token_file"), "token_file")
+            if token_file is None:
+                token = _normalize_optional_string(
+                    os.getenv("BAO_TOKEN") or os.getenv("VAULT_TOKEN"), "token"
                 )
-            try:
-                with open(token_path, "r", encoding="utf-8") as f:
-                    token = f.read().strip()
-            except Exception as e:
-                raise ValueError(
-                    f"Failed to read token from token_file '{token_path}': {e}"
-                ) from e
-            if not token:
-                raise ValueError(f"Configured token_file '{token_path}' is empty")
+        else:
+            token_file = None
+        if token is None and token_file is None:
+            token_file = _normalize_optional_string(
+                os.getenv("BAO_TOKEN_FILE") or os.getenv("VAULT_TOKEN_FILE"),
+                "token_file",
+            )
+        if token is None and token_file:
+            token = _read_secret_file(token_file, "token_file")
+    else:
+        for name, env_var in (
+            ("role_id", "BAO_ROLE_ID"),
+            ("secret_id", "BAO_SECRET_ID"),
+            ("secret_id_file", "BAO_SECRET_ID_FILE"),
+        ):
+            value = cfg.get(name)
+            if value is None:
+                value = os.getenv(env_var)
+            normalized = _normalize_optional_string(value, name)
+            if name == "role_id":
+                role_id = normalized
+            elif name == "secret_id":
+                secret_id = normalized
+            else:
+                secret_id_file = normalized
+
+    raw_renew = cfg.get("token_renew_on_401")
+    if raw_renew is None:
+        raw_renew = os.getenv("BAO_TOKEN_RENEW_ON_401")
+    token_renew_on_401 = (
+        _parse_bool(raw_renew, "token_renew_on_401") if raw_renew is not None else True
+    )
+    approle_mount = cfg.get("approle_mount")
+    if approle_mount is None:
+        approle_mount = os.getenv("BAO_APPROLE_MOUNT", "approle")
+    approle_mount = _validate_mount_name(approle_mount, "approle_mount")
+    mount_point = _validate_mount_name(cfg.get("mount_point", "secret"), "mount_point")
+    secret_field = _normalize_optional_string(
+        cfg.get("secret_field", "secret"), "secret_field"
+    )
+    if not secret_field:
+        raise ValueError("secret_field must be a non-empty string")
 
     client = _OpenBaoClient(
         url=url,
         token=token,
-        mount_point=cfg.get("mount_point", "secret"),
+        mount_point=mount_point,
         kv_version=kv_version,
-        secret_field=cfg.get("secret_field", "secret"),
+        secret_field=secret_field,
         verify_ssl=verify_ssl,
         ca_bundle=ca_bundle,
         requests_timeout=requests_timeout,
@@ -777,6 +1006,12 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
         retry_backoff_factor=retry_backoff_factor,
         pool_connections=pool_connections,
         pool_maxsize=pool_maxsize,
+        auth_method=auth_method,
+        role_id=role_id,
+        secret_id=secret_id,
+        secret_id_file=secret_id_file,
+        approle_mount=approle_mount,
+        token_renew_on_401=token_renew_on_401,
     )
     return client
 
@@ -805,14 +1040,13 @@ def kbm_get_secret(client: Any, key_id: str, wrapping_key: bytes) -> Dict[str, s
     Returns:
         Dictionary with keys: wrapped_key, blob, iv, tag (all base64-encoded)
     """
-    logger.info(f"OpenBao KBM get_secret request for key_id: {key_id}")
-
     if not isinstance(client, _OpenBaoClient):
         logger.error("Invalid client handle provided")
         raise ValueError("Invalid client handle")
-    if not key_id:
+    if not isinstance(key_id, str) or not key_id.strip():
         logger.error("key_id is required but not provided")
         raise ValueError("key_id required")
+    _validate_key_id(key_id)
     if not wrapping_key:
         logger.error("wrapping_key is required but not provided")
         raise ValueError("wrapping_key (client RSA public key) is required")
@@ -847,5 +1081,5 @@ def kbm_get_secret(client: Any, key_id: str, wrapping_key: bytes) -> Dict[str, s
         "tag": _b64(tag),
     }
 
-    logger.info(f"Successfully wrapped secret for key_id: {key_id}")
+    logger.info("Successfully wrapped secret")
     return result

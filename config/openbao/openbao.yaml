@@ -5,12 +5,34 @@
 # Fallback env vars: BAO_ADDR, then VAULT_ADDR. (Dev example: "http://127.0.0.1:8200")
 url: "https://127.0.0.1:8200"
 
-# Authentication Token
-# Precedence: token -> BAO_TOKEN -> VAULT_TOKEN -> token_file.
+# Authentication
+# Precedence: configuration file -> environment variables -> built-in defaults
+# auth_method: token (default) or approle
+auth_method: "token"
+
+# Static-token mode precedence: config token -> config token_file -> BAO_TOKEN -> VAULT_TOKEN
+# -> BAO_TOKEN_FILE -> VAULT_TOKEN_FILE
 # Pass via env var substitution (default) or hardcode for testing:
-token: "${BAO_TOKEN}"
-# Alternatively, read token from a secure mounted file (e.g., Kubernetes Secret or ramfs):
+# token: "${BAO_TOKEN}"
+# Alternatively, read a token from a secure mounted file. Environment fallbacks are
+# BAO_TOKEN_FILE, then VAULT_TOKEN_FILE.
 # token_file: "/run/secrets/bao_token"
+
+# AppRole mode (set auth_method to approle; all values below are optional in token mode)
+# auth_method: "approle"
+# role_id: "${BAO_ROLE_ID}"
+# secret_id: "${BAO_SECRET_ID}"
+# secret_id_file: "/run/secrets/bao_secret_id"  # takes precedence over secret_id
+# approle_mount: "approle"  # fallback: BAO_APPROLE_MOUNT
+# token_renew_on_401: true  # fallback: BAO_TOKEN_RENEW_ON_401
+# Environment fallbacks: BAO_AUTH_METHOD, BAO_ROLE_ID, BAO_SECRET_ID,
+# BAO_SECRET_ID_FILE, BAO_APPROLE_MOUNT, BAO_TOKEN_RENEW_ON_401.
+
+# AppRole deployment example:
+# role_id: "${BAO_ROLE_ID}"
+# secret_id_file: "/run/secrets/bao_secret_id"
+# approle_mount: "approle"
+# token_renew_on_401: true
 
 # KV Secrets Engine
 # mount_point: path where the KV engine is mounted (e.g., "secret", "kv")
@@ -25,9 +47,12 @@ secret_field: "secret"
 
 # TLS / SSL Verification
 # Set verify_ssl to false ONLY in local development/debug environments.
-# ca_bundle: optional custom CA certificate bundle for self-signed or internal CAs.
+# When ca_bundle is unset, the system CA trust store is used. Deployments using a private
+# or self-signed CA should set ca_bundle to the mounted CA bundle file. Environment
+# fallbacks: BAO_CA_BUNDLE, then VAULT_CACERT.
 verify_ssl: true
-ca_bundle: "/opt/openbao/certs/ca.crt"
+
+# ca_bundle: "/run/secrets/openbao-ca.crt"
 
 # HTTP request timeout in seconds.
 # Fallback env var: BAO_REQUESTS_TIMEOUT
