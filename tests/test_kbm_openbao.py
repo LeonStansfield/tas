@@ -36,6 +36,7 @@ from plugins.tas_kbm_openbao import (
     _OpenBaoClient,
     _parse_bool,
     _read_secret_file,
+    _validate_base_url,
     _validate_config,
     _validate_key_id,
     _validate_mount_name,
@@ -635,6 +636,13 @@ class TestOpenBaoKBM(unittest.TestCase):
                     ),
                     f"http://127.0.0.1:8200/v1/{suffix}",
                 )
+
+    def test_validate_base_url_distinguishes_parse_and_port_errors(self):
+        with self.assertRaisesRegex(ValueError, "^Invalid OpenBao URL$"):
+            _validate_base_url("https://[::1")
+
+        with self.assertRaises(ValueError):
+            _validate_base_url("https://bao.example:invalid")
 
     def test_parse_bool_valid(self):
         """Verify valid truthy and falsy boolean inputs."""

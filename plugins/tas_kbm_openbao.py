@@ -280,9 +280,9 @@ def _validate_base_url(url: str) -> str:
     normalized = url.strip().rstrip("/")
     try:
         parsed = urlparse(normalized)
-        valid_port = parsed.port
     except ValueError as exc:
-        raise ValueError("Invalid OpenBao URL port") from exc
+        raise ValueError("Invalid OpenBao URL") from exc
+    port = parsed.port
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError(
             "Invalid OpenBao URL: URL must include an http(s) scheme and host"
@@ -291,7 +291,7 @@ def _validate_base_url(url: str) -> str:
         raise ValueError(
             "Invalid OpenBao URL: credentials, query strings, and fragments are not allowed"
         )
-    if valid_port is not None and not 1 <= valid_port <= 65535:
+    if port is not None and not 1 <= port <= 65535:
         raise ValueError("Invalid OpenBao URL port")
     return normalized
 
@@ -695,24 +695,25 @@ class _OpenBaoClient:
             raise OpenBaoResponseError()
         self.token = token.strip()
         self.session.headers.update({"X-Vault-Token": self.token})
-        self._token_generation += 1
+        self._token_generation += (
+            1  # Increment token generation to indicate a new token has been obtained
+        )
 
     def _make_request(self, method: str, url: str, **kwargs: Any) -> requests.Response:
         token_generation = self._token_generation
         response = self._execute_request(method, url, **kwargs)
-        if (
-            response.status_code != 401
-            or self.auth_method != "approle"
-            or not self.token_renew_on_401
-        ):
-            return response
-        with self._reauth_lock:
-            if self._token_generation == token_generation:
-                if not self._renew_token():
-                    self._login_approle()
-        response = self._execute_request(method, url, **kwargs)
+
         if response.status_code == 401:
-            raise OpenBaoResponseError()
+            if (
+                self.auth_method == "approle" and self.token_renew_on_401
+            ):  # 401 reiceived, approle selected and token renewal on 401 is enabled, attempt to renew the token or re-login via approle and try again.
+                with self._reauth_lock:
+                    # If token_generation has changed, another request may have refreshed the shared token already, so we can skip token renew and approle login.
+                    if self._token_generation == token_generation:
+                        if not self._renew_token():
+                            self._login_approle()
+                response = self._execute_request(method, url, **kwargs)
+
         return response
 
     def _renew_token(self) -> bool:
