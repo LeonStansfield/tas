@@ -88,7 +88,7 @@ class TestOpenBaoKBM(unittest.TestCase):
             format=PublicFormat.SubjectPublicKeyInfo,
         )
         # Provide default valid test environment for tests invoking kbm_open_client_connection()
-        cls.env_patcher = patch.dict(os.environ, {"BAO_ADDR": "https://127.0.0.1:8200"})
+        cls.env_patcher = patch.dict(os.environ, {"BAO_URL": "https://127.0.0.1:8200"})
         cls.env_patcher.start()
 
     @classmethod
@@ -124,13 +124,13 @@ class TestOpenBaoKBM(unittest.TestCase):
                 patch(
                     "builtins.open",
                     unittest.mock.mock_open(
-                        read_data="url: https://localhost:8200\ntoken: ${TEST_BAO_TOKEN}\n"
+                        read_data="BAO_URL: https://localhost:8200\nBAO_TOKEN: ${TEST_BAO_TOKEN}\n"
                     ),
                 ),
             ):
                 cfg = _load_config_file("fake_config.yaml")
-                self.assertEqual(cfg["url"], "https://localhost:8200")
-                self.assertEqual(cfg["token"], "my-secret-token")
+                self.assertEqual(cfg["BAO_URL"], "https://localhost:8200")
+                self.assertEqual(cfg["BAO_TOKEN"], "my-secret-token")
 
     def test_load_config_file_not_found_raises(self):
         """None returns empty dict, but explicit non-existent path raises ValueError."""
@@ -230,7 +230,7 @@ class TestOpenBaoKBM(unittest.TestCase):
 
     def test_invalid_url_scheme_fails(self):
         """URL with non-HTTP/HTTPS scheme fails startup."""
-        with patch.dict(os.environ, {"BAO_ADDR": "ftp://127.0.0.1:8200"}):
+        with patch.dict(os.environ, {"BAO_URL": "ftp://127.0.0.1:8200"}):
             with self.assertRaises(ValueError) as ctx:
                 kbm_open_client_connection()
             self.assertIn("scheme", str(ctx.exception).lower())
@@ -238,7 +238,7 @@ class TestOpenBaoKBM(unittest.TestCase):
     def test_insecure_http_with_verify_ssl_true_fails(self):
         """Insecure http:// scheme fails validation when verify_ssl is True."""
         with patch.dict(
-            os.environ, {"BAO_ADDR": "http://127.0.0.1:8200", "BAO_VERIFY_SSL": "true"}
+            os.environ, {"BAO_URL": "http://127.0.0.1:8200", "BAO_VERIFY_SSL": "true"}
         ):
             with self.assertRaises(ValueError) as ctx:
                 kbm_open_client_connection()
@@ -247,7 +247,7 @@ class TestOpenBaoKBM(unittest.TestCase):
     def test_insecure_http_with_verify_ssl_false_succeeds(self):
         """Insecure http:// scheme is permitted only when verify_ssl is False."""
         with patch.dict(
-            os.environ, {"BAO_ADDR": "http://127.0.0.1:8200", "BAO_VERIFY_SSL": "false"}
+            os.environ, {"BAO_URL": "http://127.0.0.1:8200", "BAO_VERIFY_SSL": "false"}
         ):
             client = kbm_open_client_connection()
             self.assertEqual(client.url, "http://127.0.0.1:8200")
@@ -257,7 +257,7 @@ class TestOpenBaoKBM(unittest.TestCase):
     def test_https_with_verify_ssl_true_succeeds(self):
         """HTTPS URL with verify_ssl True succeeds."""
         with patch.dict(
-            os.environ, {"BAO_ADDR": "https://127.0.0.1:8200", "BAO_VERIFY_SSL": "true"}
+            os.environ, {"BAO_URL": "https://127.0.0.1:8200", "BAO_VERIFY_SSL": "true"}
         ):
             client = kbm_open_client_connection()
             self.assertEqual(client.url, "https://127.0.0.1:8200")
@@ -396,7 +396,7 @@ class TestOpenBaoKBM(unittest.TestCase):
         kbm_close_client_connection(client)
 
     def test_shipped_config_file_loading(self):
-        """Verify that the shipped openbao.yaml configuration parses correctly and sets requests_timeout."""
+        """Verify that the shipped openbao.yaml uses and parses BAO_* options."""
         config_path = os.path.join(
             os.path.dirname(__file__), "..", "config", "openbao", "openbao.yaml"
         )
@@ -406,15 +406,15 @@ class TestOpenBaoKBM(unittest.TestCase):
 
         cfg = _load_config_file(config_path)
         self.assertIn(
-            "requests_timeout",
+            "BAO_REQUESTS_TIMEOUT",
             cfg,
-            "requests_timeout key is missing or misspelled in config",
+            "BAO_REQUESTS_TIMEOUT key is missing or misspelled in config",
         )
-        self.assertEqual(cfg["requests_timeout"], 30)
-        self.assertIn("mount_point", cfg)
-        self.assertIn("kv_version", cfg)
-        self.assertEqual(cfg["url"], "https://127.0.0.1:8200")
-        self.assertIsNone(cfg.get("ca_bundle"))
+        self.assertEqual(cfg["BAO_REQUESTS_TIMEOUT"], 30)
+        self.assertIn("BAO_MOUNT_POINT", cfg)
+        self.assertIn("BAO_KV_VERSION", cfg)
+        self.assertEqual(cfg["BAO_URL"], "https://127.0.0.1:8200")
+        self.assertIsNone(cfg.get("BAO_CA_BUNDLE"))
         with patch.dict(os.environ, {}, clear=True):
             client = kbm_open_client_connection(config_path)
             try:
@@ -430,7 +430,9 @@ class TestOpenBaoKBM(unittest.TestCase):
             tf.write("secret-from-token-file\n")
             token_file_path = tf.name
 
-        cfg_content = f"url: https://localhost:8200\ntoken_file: {token_file_path}\n"
+        cfg_content = (
+            f"BAO_URL: https://localhost:8200\nBAO_TOKEN_FILE: {token_file_path}\n"
+        )
         with tempfile.NamedTemporaryFile("w", delete=False, suffix=".yaml") as cf:
             cf.write(cfg_content)
             config_yaml_path = cf.name
@@ -438,7 +440,7 @@ class TestOpenBaoKBM(unittest.TestCase):
         try:
             with patch.dict(os.environ, {"BAO_TOKEN": "environment-token"}, clear=True):
                 client = kbm_open_client_connection(config_yaml_path)
-                self.assertEqual(client.token, "secret-from-token-file")
+                self.assertEqual(client.token, "environment-token")
                 kbm_close_client_connection(client)
         finally:
             os.remove(token_file_path)
@@ -478,13 +480,13 @@ class TestOpenBaoKBM(unittest.TestCase):
 
     def test_factory_rejects_invalid_string_configuration(self):
         invalid_configs = (
-            {"mount_point": ["secret"]},
-            {"secret_field": True},
-            {"token": 123},
-            {"token_file": 123},
-            {"approle_mount": ["approle"]},
-            {"mount_point": "team//kv"},
-            {"approle_mount": "team/../approle"},
+            {"BAO_MOUNT_POINT": ["secret"]},
+            {"BAO_SECRET_FIELD": True},
+            {"BAO_TOKEN": 123},
+            {"BAO_TOKEN_FILE": 123},
+            {"BAO_APPROLE_MOUNT": ["approle"]},
+            {"BAO_MOUNT_POINT": "team//kv"},
+            {"BAO_APPROLE_MOUNT": "team/../approle"},
         )
         for config in invalid_configs:
             with self.subTest(config=config):
@@ -502,8 +504,8 @@ class TestOpenBaoKBM(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "BAO_ADDR": "https://bao.example:8200",
-                "BAO_AUTH_METHOD": "token",
+                "BAO_URL": "https://bao.example:8200",
+                "BAO_AUTH_METHOD": "approle",
                 "BAO_ROLE_ID": "environment-role",
                 "BAO_SECRET_ID": "environment-secret",
                 "BAO_APPROLE_MOUNT": "environment-mount",
@@ -512,19 +514,19 @@ class TestOpenBaoKBM(unittest.TestCase):
             with patch(
                 "plugins.tas_kbm_openbao._load_config_file",
                 return_value={
-                    "auth_method": "approle",
-                    "role_id": "config-role",
-                    "secret_id": "config-secret",
-                    "approle_mount": "config-mount",
+                    "BAO_AUTH_METHOD": "approle",
+                    "BAO_ROLE_ID": "config-role",
+                    "BAO_SECRET_ID": "config-secret",
+                    "BAO_APPROLE_MOUNT": "config-mount",
                 },
             ):
                 client = kbm_open_client_connection("ignored.yaml")
                 try:
-                    self.assertEqual(client.role_id, "config-role")
-                    self.assertEqual(client.approle_mount, "config-mount")
+                    self.assertEqual(client.role_id, "environment-role")
+                    self.assertEqual(client.approle_mount, "environment-mount")
                     self.assertEqual(
                         mock_post.call_args.kwargs["json"]["secret_id"],
-                        "config-secret",
+                        "environment-secret",
                     )
                     self.assertEqual(client.token, "token")
                 finally:
@@ -534,7 +536,7 @@ class TestOpenBaoKBM(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "BAO_ADDR": "https://bao.example:8200",
+                "BAO_URL": "https://bao.example:8200",
                 "BAO_AUTH_METHOD": "approle",
                 "BAO_ROLE_ID": "environment-role",
                 "BAO_SECRET_ID": "environment-secret",
@@ -667,7 +669,7 @@ class TestOpenBaoKBM(unittest.TestCase):
         with patch.dict(
             os.environ,
             {
-                "BAO_ADDR": "https://127.0.0.1:8200",
+                "BAO_URL": "https://127.0.0.1:8200",
                 "BAO_CA_BUNDLE": "/path/to/missing-ca.pem",
             },
         ):
@@ -686,7 +688,7 @@ class TestOpenBaoKBM(unittest.TestCase):
             with patch.dict(
                 os.environ,
                 {
-                    "BAO_ADDR": "https://127.0.0.1:8200",
+                    "BAO_URL": "https://127.0.0.1:8200",
                     "BAO_CA_BUNDLE": ca_path,
                 },
             ):
@@ -705,7 +707,7 @@ class TestOpenBaoKBM(unittest.TestCase):
                 with patch.dict(
                     os.environ,
                     {
-                        "BAO_ADDR": "https://127.0.0.1:8200",
+                        "BAO_URL": "https://127.0.0.1:8200",
                         "BAO_KV_VERSION": str(ver),
                     },
                 ):
@@ -720,7 +722,7 @@ class TestOpenBaoKBM(unittest.TestCase):
                 with patch.dict(
                     os.environ,
                     {
-                        "BAO_ADDR": "https://127.0.0.1:8200",
+                        "BAO_URL": "https://127.0.0.1:8200",
                         "BAO_KV_VERSION": str(ver),
                     },
                 ):
@@ -736,7 +738,7 @@ class TestOpenBaoKBM(unittest.TestCase):
                 with patch.dict(
                     os.environ,
                     {
-                        "BAO_ADDR": "https://127.0.0.1:8200",
+                        "BAO_URL": "https://127.0.0.1:8200",
                         "BAO_REQUESTS_TIMEOUT": str(timeout),
                     },
                 ):
@@ -751,7 +753,7 @@ class TestOpenBaoKBM(unittest.TestCase):
                 with patch.dict(
                     os.environ,
                     {
-                        "BAO_ADDR": "https://127.0.0.1:8200",
+                        "BAO_URL": "https://127.0.0.1:8200",
                         "BAO_POOL_CONNECTIONS": str(val),
                     },
                 ):
@@ -766,7 +768,7 @@ class TestOpenBaoKBM(unittest.TestCase):
                 with patch.dict(
                     os.environ,
                     {
-                        "BAO_ADDR": "https://127.0.0.1:8200",
+                        "BAO_URL": "https://127.0.0.1:8200",
                         "BAO_POOL_MAXSIZE": str(val),
                     },
                 ):
@@ -781,7 +783,7 @@ class TestOpenBaoKBM(unittest.TestCase):
                 with patch.dict(
                     os.environ,
                     {
-                        "BAO_ADDR": "https://127.0.0.1:8200",
+                        "BAO_URL": "https://127.0.0.1:8200",
                         "BAO_RETRY_TOTAL": str(val),
                     },
                 ):
@@ -796,7 +798,7 @@ class TestOpenBaoKBM(unittest.TestCase):
                 with patch.dict(
                     os.environ,
                     {
-                        "BAO_ADDR": "https://127.0.0.1:8200",
+                        "BAO_URL": "https://127.0.0.1:8200",
                         "BAO_RETRY_BACKOFF_FACTOR": str(val),
                     },
                 ):
@@ -1145,7 +1147,7 @@ class TestOpenBaoKBM(unittest.TestCase):
                 with patch.dict(
                     os.environ,
                     {
-                        "BAO_ADDR": "https://127.0.0.1:8200",
+                        "BAO_URL": "https://127.0.0.1:8200",
                         "BAO_KV_VERSION": str(bad_val),
                     },
                 ):
@@ -1158,7 +1160,7 @@ class TestOpenBaoKBM(unittest.TestCase):
                 with patch.dict(
                     os.environ,
                     {
-                        "BAO_ADDR": "https://127.0.0.1:8200",
+                        "BAO_URL": "https://127.0.0.1:8200",
                         "BAO_RETRY_BACKOFF_FACTOR": str(bad_val),
                     },
                 ):
@@ -1223,7 +1225,7 @@ class TestOpenBaoKBM(unittest.TestCase):
     def test_factory_rejects_invalid_renewal_configuration(self):
         with patch(
             "plugins.tas_kbm_openbao._load_config_file",
-            return_value={"token_renew_on_401": "maybe"},
+            return_value={"BAO_TOKEN_RENEW_ON_401": "maybe"},
         ):
             with self.assertRaises(ValueError):
                 kbm_open_client_connection("ignored.yaml")

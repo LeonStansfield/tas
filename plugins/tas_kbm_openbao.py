@@ -198,7 +198,7 @@ def _validate_config(
     # Require explicit URL
     if not url or not isinstance(url, str) or not url.strip():
         raise ValueError(
-            "OpenBao URL is required. Specify 'url' in configuration or set BAO_ADDR/VAULT_ADDR."
+            "OpenBao URL is required. Specify 'BAO_URL' in configuration or set BAO_URL."
         )
 
     url = _validate_base_url(url)
@@ -821,9 +821,9 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
     cfg = _load_config_file(config_file)
 
     def _get_required_int(key: str, env_var: str, default: int) -> int:
-        val = cfg.get(key)
+        val = os.getenv(env_var)
         if val is None:
-            val = os.getenv(env_var)
+            val = cfg.get(f"BAO_{key.upper()}", default)
         if val is None:
             return default
 
@@ -860,9 +860,9 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
         )
 
     def _get_required_float(key: str, env_var: str, default: float) -> float:
-        val = cfg.get(key)
+        val = os.getenv(env_var)
         if val is None:
-            val = os.getenv(env_var)
+            val = cfg.get(f"BAO_{key.upper()}")
         if val is None:
             return default
 
@@ -887,24 +887,18 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
         return f_val
 
     # Resolve connection & security parameters
-    url = cfg.get("url")
-    if url is None:
-        url = os.getenv("BAO_ADDR") or os.getenv("VAULT_ADDR")
+    url = os.getenv("BAO_URL") or cfg.get("BAO_URL")
     url = _normalize_optional_string(url, "url")
 
-    raw_verify_ssl = cfg.get("verify_ssl")
+    raw_verify_ssl = os.getenv("BAO_VERIFY_SSL")
     if raw_verify_ssl is None:
-        raw_verify_ssl = os.getenv("BAO_VERIFY_SSL")
-    if raw_verify_ssl is None:
-        raw_verify_ssl = os.getenv("VAULT_VERIFY_SSL")
+        raw_verify_ssl = cfg.get("BAO_VERIFY_SSL")
     if raw_verify_ssl is None:
         verify_ssl = True
     else:
         verify_ssl = _parse_bool(raw_verify_ssl, "verify_ssl")
 
-    ca_bundle = cfg.get("ca_bundle")
-    if ca_bundle is None:
-        ca_bundle = os.getenv("BAO_CA_BUNDLE") or os.getenv("VAULT_CACERT")
+    ca_bundle = os.getenv("BAO_CA_BUNDLE") or cfg.get("BAO_CA_BUNDLE")
     ca_bundle = _normalize_optional_string(ca_bundle, "ca_bundle")
 
     # Resolve engine, timeouts, pool and retry settings
@@ -930,9 +924,9 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
         retry_backoff_factor=retry_backoff_factor,
     )
 
-    raw_auth_method = cfg.get("auth_method")
+    raw_auth_method = os.getenv("BAO_AUTH_METHOD")
     if raw_auth_method is None:
-        raw_auth_method = os.getenv("BAO_AUTH_METHOD")
+        raw_auth_method = cfg.get("BAO_AUTH_METHOD")
     if raw_auth_method is None:
         raw_auth_method = "token"
     if not isinstance(raw_auth_method, str):
@@ -943,18 +937,14 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
     token = None
     role_id = secret_id = secret_id_file = None
     if auth_method == "token":
-        token = _normalize_optional_string(cfg.get("token"), "token")
+        token = _normalize_optional_string(
+            os.getenv("BAO_TOKEN") or cfg.get("BAO_TOKEN"),
+            "token",
+        )
+        token_file = None
         if token is None:
-            token_file = _normalize_optional_string(cfg.get("token_file"), "token_file")
-            if token_file is None:
-                token = _normalize_optional_string(
-                    os.getenv("BAO_TOKEN") or os.getenv("VAULT_TOKEN"), "token"
-                )
-        else:
-            token_file = None
-        if token is None and token_file is None:
             token_file = _normalize_optional_string(
-                os.getenv("BAO_TOKEN_FILE") or os.getenv("VAULT_TOKEN_FILE"),
+                os.getenv("BAO_TOKEN_FILE") or cfg.get("BAO_TOKEN_FILE"),
                 "token_file",
             )
         if token is None and token_file:
@@ -965,9 +955,9 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
             ("secret_id", "BAO_SECRET_ID"),
             ("secret_id_file", "BAO_SECRET_ID_FILE"),
         ):
-            value = cfg.get(name)
+            value = os.getenv(env_var)
             if value is None:
-                value = os.getenv(env_var)
+                value = cfg.get(f"BAO_{name.upper()}")
             normalized = _normalize_optional_string(value, name)
             if name == "role_id":
                 role_id = normalized
@@ -976,19 +966,21 @@ def kbm_open_client_connection(config_file: Optional[str] = None) -> _OpenBaoCli
             else:
                 secret_id_file = normalized
 
-    raw_renew = cfg.get("token_renew_on_401")
+    raw_renew = os.getenv("BAO_TOKEN_RENEW_ON_401")
     if raw_renew is None:
-        raw_renew = os.getenv("BAO_TOKEN_RENEW_ON_401")
+        raw_renew = cfg.get("BAO_TOKEN_RENEW_ON_401")
     token_renew_on_401 = (
         _parse_bool(raw_renew, "token_renew_on_401") if raw_renew is not None else True
     )
-    approle_mount = cfg.get("approle_mount")
+    approle_mount = os.getenv("BAO_APPROLE_MOUNT")
     if approle_mount is None:
-        approle_mount = os.getenv("BAO_APPROLE_MOUNT", "approle")
+        approle_mount = cfg.get("BAO_APPROLE_MOUNT", "approle")
     approle_mount = _validate_mount_name(approle_mount, "approle_mount")
-    mount_point = _validate_mount_name(cfg.get("mount_point", "secret"), "mount_point")
+    mount_point = _validate_mount_name(
+        cfg.get("BAO_MOUNT_POINT", "secret"), "mount_point"
+    )
     secret_field = _normalize_optional_string(
-        cfg.get("secret_field", "secret"), "secret_field"
+        cfg.get("BAO_SECRET_FIELD", "secret"), "secret_field"
     )
     if not secret_field:
         raise ValueError("secret_field must be a non-empty string")
