@@ -754,52 +754,66 @@ class _OpenBaoClient:
         resp = self._make_request("GET", url)
 
         if resp.status_code == 404:
-            logger.error("Secret not found in OpenBao")
+            logger.error(f"Secret not found in OpenBao: {key_id}")
             raise ValueError("Secret not found")
         elif resp.status_code != 200:
-            logger.error(f"OpenBao secret retrieval failed ({resp.status_code})")
+            logger.error(
+                f"OpenBao secret retrieval failed ({resp.status_code}) for key_id {key_id}"
+            )
             raise OpenBaoResponseError()
 
         try:
             payload = resp.json()
         except Exception as e:
-            logger.error("Failed to parse OpenBao response as JSON")
+            logger.error(
+                f"Failed to parse OpenBao response as JSON for key_id: {key_id}"
+            )
             raise OpenBaoResponseError() from e
 
         if not isinstance(payload, dict):
             logger.error(
-                f"Invalid OpenBao response structure: expected JSON object, got {type(payload).__name__}"
+                f"Invalid OpenBao response structure for key_id {key_id}: expected JSON object, got {type(payload).__name__}"
             )
             raise OpenBaoResponseError()
 
         if self.kv_version == 2:
             top_data = payload.get("data")
             if top_data is None:
+                logger.error(
+                    f"OpenBao response contains null data for key_id: {key_id}"
+                )
                 raise OpenBaoResponseError()
             if not isinstance(top_data, dict):
+                logger.error(
+                    f"Invalid OpenBao response structure for key_id {key_id}: expected data dictionary, got {type(top_data).__name__}"
+                )
                 raise OpenBaoResponseError()
             data = top_data.get("data")
         else:
             data = payload.get("data")
 
         if data is None:
-            logger.error("OpenBao response contains null secret data")
+            logger.error(
+                f"OpenBao response contains null secret data for key_id: {key_id}"
+            )
             raise OpenBaoResponseError()
 
         if not isinstance(data, dict):
             logger.error(
-                f"Invalid OpenBao response structure: expected secret data dictionary, got {type(data).__name__}"
+                f"Invalid OpenBao response structure for key_id {key_id}: expected secret data dictionary, got {type(data).__name__}"
             )
             raise OpenBaoResponseError()
 
         if self.secret_field not in data:
-            logger.error("Configured secret field not found in OpenBao secret data")
+            logger.error(
+                f"Secret field '{self.secret_field}' not found in OpenBao secret data for key_id: {key_id}"
+            )
             raise ValueError("Secret field not found in OpenBao secret data")
 
         val = data[self.secret_field]
         if val is None:
             logger.error(
-                "OpenBao returned a null value for the configured secret field"
+                f"OpenBao returned a null value for the configured secret field for key_id: {key_id}"
             )
             raise OpenBaoResponseError()
         return _secret_to_bytes(val)
@@ -1033,6 +1047,8 @@ def kbm_get_secret(client: Any, key_id: str, wrapping_key: bytes) -> Dict[str, s
     Returns:
         Dictionary with keys: wrapped_key, blob, iv, tag (all base64-encoded)
     """
+    logger.info(f"OpenBao KBM get_secret request for key_id: {key_id}")
+
     if not isinstance(client, _OpenBaoClient):
         logger.error("Invalid client handle provided")
         raise ValueError("Invalid client handle")
@@ -1074,5 +1090,5 @@ def kbm_get_secret(client: Any, key_id: str, wrapping_key: bytes) -> Dict[str, s
         "tag": _b64(tag),
     }
 
-    logger.info("Successfully wrapped secret")
+    logger.info(f"Successfully wrapped secret for key_id: {key_id}")
     return result

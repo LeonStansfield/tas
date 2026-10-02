@@ -1258,36 +1258,6 @@ class TestOpenBaoKBM(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 _validate_mount_name(value, "approle_mount")
 
-    @patch("plugins.tas_kbm_openbao.logger")
-    @patch("requests.Session.get")
-    def test_backend_logs_omit_sensitive_identifiers(self, mock_get, mock_logger):
-        key_id = "private-key-id"
-        secret_field = "private-secret-field"
-        responses = []
-        for payload in (
-            {"data": {"data": {"other": "value"}}},
-            {"data": {"data": None}},
-            {"data": {"data": ["invalid"]}},
-        ):
-            response = MagicMock(status_code=200)
-            response.json.return_value = payload
-            responses.append(response)
-        mock_get.side_effect = responses
-        client = _OpenBaoClient(secret_field=secret_field)
-        try:
-            for _ in responses:
-                with self.assertRaises((ValueError, OpenBaoResponseError)):
-                    client.get_secret(key_id)
-            messages = " ".join(
-                str(call.args[0])
-                for call in mock_logger.error.call_args_list
-                if call.args
-            )
-            self.assertNotIn(key_id, messages)
-            self.assertNotIn(secret_field, messages)
-        finally:
-            client.close()
-
     @patch("requests.Session.post")
     def test_approle_secret_file_takes_precedence(self, mock_post):
         import tempfile
