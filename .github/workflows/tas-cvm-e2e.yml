@@ -1,0 +1,82 @@
+name: TAS CVM E2E test
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Open PR number in TEE-Attestation/tas (must target main)"
+        required: true
+        type: number
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: read
+
+concurrency:
+  group: tas-cvm-e2e
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    name: Run TAS attestation test in a Confidential VM
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - name: Validate PR and resolve its head revision
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          pr="$(gh api "repos/TEE-Attestation/tas/pulls/$PR_NUMBER")"
+          state="$(jq -r '.state' <<<"$pr")"
+          base="$(jq -r '.base.ref' <<<"$pr")"
+          repo="$(jq -r '.head.repo.full_name // empty' <<<"$pr")"
+          branch="$(jq -r '.head.ref' <<<"$pr")"
+          sha="$(jq -r '.head.sha' <<<"$pr")"
+
+          [[ "$state" == open ]] || { echo "PR #$PR_NUMBER is not open." >&2; exit 1; }
+          [[ "$base" == main ]] || { echo "PR #$PR_NUMBER targets '$base', not main." >&2; exit 1; }
+          [[ -n "$repo" && -n "$branch" && "$sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo "PR #$PR_NUMBER has no available head repository or commit." >&2
+            exit 1
+          }
+
+          echo "repo_url=https://github.com/$repo.git" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Testing PR #$PR_NUMBER from $repo, branch $branch, commit $sha"
+
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Authenticate with Workload Identity Federation
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093
+        with:
+          workload_identity_provider: projects/811403034336/locations/global/workloadIdentityPools/github-actions/providers/github
+          service_account: tas-e2e-test@hpe-labs-cc.iam.gserviceaccount.com
+          create_credentials_file: true
+
+      - name: Set up gcloud CLI
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f
+        with:
+          project_id: hpe-labs-cc
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
+        with:
+          terraform_version: 1.9.8
+          terraform_wrapper: false
+
+      - name: Provision CVM and run TAS E2E test
+        env:
+          TF_VAR_project_id: hpe-labs-cc
+          TF_VAR_region: europe-west4
+          TF_VAR_zone: europe-west4-a
+          TAS_REPO_URL: ${{ steps.pr.outputs.repo_url }}
+          TAS_BRANCH: ${{ steps.pr.outputs.branch }}
+          TAS_COMMIT: ${{ steps.pr.outputs.sha }}
+          TAS_VM_MAX_RUNTIME_MINUTES: "90"
+        run: bash ci/tas-cvm-e2e/run.sh
